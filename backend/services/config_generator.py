@@ -367,7 +367,9 @@ def _inbound_rules_from_group_firewall(inbound_rules: list[Any]) -> list[dict[st
         if not allowed_group:
             continue
         protocol = (r.get("protocol") or r.get("proto") or "any").strip().lower()
-        if protocol not in ("any", "tcp", "udp", "icmp"):
+        # icmp = IPv4 ICMP; icmpv6 = IPv6 ICMP (required for ping/PMTU on IPv6 overlays)
+        if protocol not in ("any", "tcp", "udp", "icmp", "icmpv6"):
+            logger.warning("Unknown firewall protocol %r; coercing to any", protocol)
             protocol = "any"
         port_range = (r.get("port_range") or str(r.get("port", "any")).strip() or "any").strip()
         ports = _parse_port_range(port_range)
@@ -408,11 +410,36 @@ def _local_cidr_rules_for_consumers(node: Node, peer_nodes: list[Node]) -> list[
             continue
         for consumer_id in r.get("consumers") or []:
             consumer_ip = ip_by_id.get(consumer_id)
-            if consumer_ip:
-                rules.append({"port": "any", "proto": "any", "cidr": f"{consumer_ip}/32", "local_cidr": route})
+            if not consumer_ip:
+                continue
+            try:
+                host_cidr = _host_cidr(consumer_ip)
+            except ValueError as e:
+                logger.error(
+                    "Skipping local_cidr consumer rule: invalid consumer IP %r on node %s: %s",
+                    consumer_ip,
+                    node.id,
+                    e,
+                )
+                continue
+            rules.append(
+                {
+                    "port": "any",
+                    "proto": "any",
+                    "cidr": host_cidr,
+                    "local_cidr": route,
+                }
+            )
         for group in r.get("consumer_groups") or []:
             rules.append({"port": "any", "proto": "any", "group": group, "local_cidr": route})
     return rules
+
+
+def _host_cidr(ip: str) -> str:
+    """Single-host CIDR for a Nebula overlay address (/32 v4, /128 v6)."""
+    addr = ipaddress.ip_address(ip.strip())
+    prefix = 32 if addr.version == 4 else 128
+    return f"{addr}/{prefix}"
 
 
 def _firewall_section(

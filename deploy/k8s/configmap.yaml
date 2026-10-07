@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-qfield-config
+  namespace: app-qfield
+data:
+  # Browser-facing base URL (must match Ingress host if using host-based routing).
+  public_url: "http://qfield.holarchy.cloud"

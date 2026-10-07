@@ -159,3 +159,43 @@ def test_route_saved_before_consumer_groups_existed_still_works():
     assert _local_cidr_rules(gateway_cfg) == [
         {"port": "any", "proto": "any", "cidr": "10.100.0.2/32", "local_cidr": "192.168.1.0/24"}
     ]
+
+
+def test_ipv6_consumer_gets_slash128_local_cidr_rule():
+    network = Network(id=1, name="v6-net", subnet_cidr="fd00:1::/64")
+    gateway = Node(
+        id=1,
+        network_id=1,
+        hostname="gateway",
+        ip_address="fd00:1::1",
+        groups=[],
+        unsafe_routes=[{"route": "fd10::/64", "source": "manual", "consumers": [2]}],
+    )
+    consumer = Node(
+        id=2, network_id=1, hostname="consumer", ip_address="fd00:1::2", groups=[], unsafe_routes=[]
+    )
+
+    config = yaml.safe_load(build_config(gateway, network, [consumer], group_firewalls=[]))
+    rules = _local_cidr_rules(config)
+    assert rules == [
+        {"port": "any", "proto": "any", "cidr": "fd00:1::2/128", "local_cidr": "fd10::/64"}
+    ]
+
+
+def test_icmpv6_inbound_rule_preserved():
+    network = Network(id=1, name="v6-net", subnet_cidr="fd00:1::/64")
+    group_fw = NetworkGroupFirewall(
+        network_id=1,
+        group_name="mesh",
+        inbound_rules=[{"allowed_group": "mesh", "protocol": "icmpv6", "port_range": "any"}],
+    )
+    node = Node(
+        id=1,
+        network_id=1,
+        hostname="n1",
+        ip_address="fd00:1::1",
+        groups=["mesh"],
+        unsafe_routes=[],
+    )
+    config = yaml.safe_load(build_config(node, network, [], group_firewalls=[group_fw]))
+    assert any(r.get("proto") == "icmpv6" for r in config["firewall"]["inbound"])

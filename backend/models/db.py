@@ -28,6 +28,10 @@ class Network(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     subnet_cidr: Mapped[str] = mapped_column(String(64), nullable=False)
+    # CIDRs baked into every host cert (Nebula -ip networks) so L3 mesh can span a
+    # broader space than the allocation pool. Default expansive ULA; policy is not
+    # enforced here (host/Nebula firewalls + FRR handle that for now).
+    cert_subnets: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     ca_cert_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     ca_key_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     cert_version: Mapped[int] = mapped_column(Integer, default=2)  # nebula cert format version for this network's CA

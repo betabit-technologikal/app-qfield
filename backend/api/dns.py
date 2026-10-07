@@ -1,6 +1,8 @@
 """DNS configuration API for per-network dnsmasq zones."""
 from typing import List, Optional
 import hashlib
+import ipaddress
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import PlainTextResponse
@@ -20,8 +22,29 @@ from ..models import (
 )
 from ..services.audit import get_client_ip, log_audit
 
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/networks/{network_id}/dns", tags=["dns"])
+
+
+def _dnsmasq_host_record(name: str, ip: str) -> str:
+    """
+    Build a dnsmasq host-record line for a single overlay address.
+
+    dnsmasq form: host-record=name[,name...],[IPv4],[IPv6]
+    For IPv6-only overlays the IPv4 slot must be left empty so the address is
+    not mis-parsed: host-record=name,,2001:db8::1
+    """
+    addr = ipaddress.ip_address(ip.strip())
+    if addr.version == 4:
+        return f"host-record={name},{addr}"
+    return f"host-record={name},,{addr}"
+
+
+def _dnsmasq_address_rr(name: str, ip: str) -> str:
+    """address=/name/ip works for both A and AAAA based on address family."""
+    addr = ipaddress.ip_address(ip.strip())
+    return f"address=/{name}/{addr}"
 
 
 # Pydantic v2 uses `pattern` instead of `regex` for constrained strings.
@@ -361,13 +384,25 @@ def _build_dnsmasq_config(
             fallback_ip = n.ip_address
             break
     if fallback_ip:
-        lines.append(f"address=/{domain}/{fallback_ip}")
-        lines.append(f"host-record={domain},{fallback_ip}")
+        try:
+            lines.append(_dnsmasq_address_rr(domain, fallback_ip))
+            lines.append(_dnsmasq_host_record(domain, fallback_ip))
+        except ValueError as e:
+            logger.error("dnsmasq: invalid fallback overlay IP %r: %s", fallback_ip, e)
     for n in nodes:
         if not n.hostname or not n.ip_address:
             continue
         fqdn = f"{n.hostname}.{domain}"
-        lines.append(f"host-record={fqdn},{n.ip_address}")
+        try:
+            lines.append(_dnsmasq_host_record(fqdn, n.ip_address))
+        except ValueError as e:
+            logger.error(
+                "dnsmasq: skipping host-record for node_id=%s hostname=%r ip=%r: %s",
+                n.id,
+                n.hostname,
+                n.ip_address,
+                e,
+            )
     node_by_id = {n.id: n for n in nodes}
     for a in aliases:
         node = node_by_id.get(a.node_id)
@@ -378,10 +413,28 @@ def _build_dnsmasq_config(
             # which is dnsmasq's native equivalent of a wildcard - unlike
             # host-record=, which is exact-match only.
             base = a.alias[2:]
-            lines.append(f"address=/{base}.{domain}/{node.ip_address}")
+            try:
+                lines.append(_dnsmasq_address_rr(f"{base}.{domain}", node.ip_address))
+            except ValueError as e:
+                logger.error(
+                    "dnsmasq: skipping wildcard alias %r node_id=%s ip=%r: %s",
+                    a.alias,
+                    node.id,
+                    node.ip_address,
+                    e,
+                )
         else:
             fqdn = f"{a.alias}.{domain}"
-            lines.append(f"host-record={fqdn},{node.ip_address}")
+            try:
+                lines.append(_dnsmasq_host_record(fqdn, node.ip_address))
+            except ValueError as e:
+                logger.error(
+                    "dnsmasq: skipping alias %r node_id=%s ip=%r: %s",
+                    a.alias,
+                    node.id,
+                    node.ip_address,
+                    e,
+                )
     lines.append("")
     # Upstream servers last: used only for queries not in our local zone
     for s in upstream_servers or []:

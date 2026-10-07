@@ -205,14 +205,19 @@ def cert_sign(
     duration_hours: int = 8760,  # 1 year
     in_pub: Optional[Path] = None,
     subnet_cidr: Optional[str] = None,
+    cert_subnets: Optional[list[str]] = None,
     unsafe_subnets: Optional[list[str]] = None,
     allowed_roots: Optional[List[Path]] = None,
 ) -> None:
     """
     Sign a host certificate. If in_pub is set, sign the given public key (betterkeys).
     Otherwise nebula-cert will generate a keypair and we only get the cert (not recommended).
-    -ip is passed as CIDR. Use subnet_cidr (e.g. 10.100.0.0/24) so the cert uses the network's
-    prefix length; that gives hosts "vpnNetworks in common" and allows layer-3 traffic between them.
+
+    -ip is one or more CIDRs. With subnet_cidr, builds:
+      allocated_ip/allocation_prefixlen
+      plus allocated_ip/prefix for each cert_subnet that contains the host
+    (default cert_subnets [fd00::/8] when None). That gives hosts overlapping VPN
+    networks for mesh L3 beyond the allocation pool.
 
     unsafe_subnets: CIDRs this node is allowed to route for as a subnet-router/exit-node
     gateway (Nebula's tun.unsafe_routes on *other* nodes points its `via` at this node only
@@ -230,29 +235,75 @@ def cert_sign(
     out_crt.parent.mkdir(parents=True, exist_ok=True)
     # Strip any existing /suffix from ip so we control the prefix
     ip_base = ip.split("/")[0].strip()
+    try:
+        ip_obj = ipaddress.ip_address(ip_base)
+    except ValueError as e:
+        logger.error("cert_sign invalid host IP %r for name=%r: %s", ip, name, e)
+        raise ValueError(f"Invalid host IP for certificate: {ip_base!r}") from e
     if subnet_cidr:
-        net = ipaddress.ip_network(subnet_cidr.strip(), strict=False)
-        ip_cidr = f"{ip_base}/{net.prefixlen}"
+        # Allocation membership + network cert_subnets (e.g. fd00::/8) as multi -ip claims.
+        from ..services.cert_networks import host_cert_ip_cidrs
+
+        try:
+            ip_cidrs = host_cert_ip_cidrs(
+                allocated_ip=str(ip_obj),
+                allocation_cidr=subnet_cidr,
+                cert_subnets=cert_subnets,
+            )
+        except ValueError:
+            logger.exception(
+                "cert_sign failed building -ip list name=%r ip=%s subnet=%s cert_subnets=%s",
+                name,
+                ip_base,
+                subnet_cidr,
+                cert_subnets,
+            )
+            raise
     else:
-        ip_cidr = ip if "/" in ip else f"{ip_base}/32"
+        # Single-host fallback when no network prefix is provided
+        host_prefix = 32 if ip_obj.version == 4 else 128
+        ip_cidrs = [ip if "/" in ip else f"{ip_obj}/{host_prefix}"]
+        if cert_subnets:
+            logger.warning(
+                "cert_sign: cert_subnets=%s ignored without subnet_cidr for name=%r",
+                cert_subnets,
+                name,
+            )
     args = [
         "sign",
         "-ca-crt", _path_arg(ca_crt),
         "-ca-key", _path_arg(ca_key),
         "-name", name,
-        "-ip", ip_cidr,
         "-out-crt", _path_arg(out_crt),
         "-duration", f"{duration_hours}h",
     ]
+    # Repeated -ip: allocation prefix plus broader cert_subnet memberships.
+    for cidr in ip_cidrs:
+        args.extend(["-ip", cidr])
     if groups:
         args.extend(["-groups", ",".join(groups)])
     if unsafe_subnets:
         args.extend(["-subnets", ",".join(unsafe_subnets)])
     if in_pub is not None:
         args.extend(["-in-pub", _path_arg(in_pub)])
-    run_nebula_cert(args)
-    logger.info("Signed certificate for %s at %s", name, out_crt)
-
+    logger.info(
+        "cert_sign name=%r ip_cidrs=%s groups=%s unsafe_subnets=%s",
+        name,
+        ip_cidrs,
+        groups or [],
+        unsafe_subnets or [],
+    )
+    try:
+        run_nebula_cert(args)
+    except Exception:
+        logger.exception(
+            "cert_sign nebula-cert failed name=%r ip_cidrs=%s args=%s",
+            name,
+            ip_cidrs,
+            args,
+        )
+        raise
+    logger.info("Signed certificate for %s at %s (ip_cidrs=%s)", name, out_crt, ip_cidrs)
 
 def cert_info(cert_pem: str) -> tuple[str, "datetime"]:
     """(fingerprint, not_after) of a certificate, via `nebula-cert print -json`.

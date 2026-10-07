@@ -1,7 +1,7 @@
 /** Defined.net-style inbound rule: who can send traffic to this group. */
 export interface InboundFirewallRule {
   allowed_group: string;
-  protocol: "any" | "tcp" | "udp" | "icmp";
+  protocol: "any" | "tcp" | "udp" | "icmp" | "icmpv6";
   port_range: string;
   description?: string;
 }
@@ -10,6 +10,8 @@ export interface Network {
   id: number;
   name: string;
   subnet_cidr: string;
+  /** CIDRs embedded in every host cert for mesh L3 (default fd00::/8). */
+  cert_subnets: string[];
   ca_cert_path: string | null;
   cert_version: number;
   cert_curve: "25519" | "P256";
@@ -29,10 +31,13 @@ export interface NetworkCreate {
   name: string;
   subnet_cidr: string;
   cert_curve?: "25519" | "P256";
+  /** Omit to use default expansive ULA claim fd00::/8 on every host cert. */
+  cert_subnets?: string[];
 }
 
 export interface NetworkUpdateData {
   // No network-level firewall; use Groups page for per-group inbound rules.
+  cert_subnets?: string[];
 }
 
 export interface GroupFirewallConfig {

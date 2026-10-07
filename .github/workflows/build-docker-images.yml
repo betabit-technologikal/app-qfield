@@ -1,21 +1,35 @@
 name: Build and Push Docker Images
 
+# Publish backend + frontend (and optional ncclient) images to GHCR so they can
+# be pulled by any cluster. Images are namespaced under this repository owner.
 on:
-  # Run after ncclient binaries are built and uploaded to GitHub Releases
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "client/**"
+      - "docker/**"
+      - ".github/workflows/build-docker-images.yml"
+  # Still rebuild when ncclient release binaries land
   workflow_run:
     workflows: ["Build ncclient Binaries"]
     types: [completed]
-  workflow_dispatch:  # Allow manual trigger (uses VERSION=latest)
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image tag (default: latest or git tag)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
-  # build-* jobs add packages: write for pushing to GHCR
 
 env:
   REGISTRY: ghcr.io
-  BACKEND_IMAGE_NAME: nixrtr/nebula-commander-backend
-  FRONTEND_IMAGE_NAME: nixrtr/nebula-commander-frontend
-  NCCLIENT_IMAGE_NAME: nixrtr/nebula-commander-ncclient
+  # Lowercase owner/name for GHCR (GitHub requires lowercase image refs).
+  # Example: ghcr.io/betabit-technologikal/app-qfield-backend:latest
 
 jobs:
   get-version:
@@ -25,32 +39,52 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      owner: ${{ steps.meta.outputs.owner }}
+      backend_image: ${{ steps.meta.outputs.backend }}
+      frontend_image: ${{ steps.meta.outputs.frontend }}
+      ncclient_image: ${{ steps.meta.outputs.ncclient }}
     steps:
-      - name: Checkout (for tag resolution)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set version
+      - name: Resolve owner and image names
+        id: meta
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "owner=${OWNER}" >> "$GITHUB_OUTPUT"
+          echo "backend=${OWNER}/app-qfield-backend" >> "$GITHUB_OUTPUT"
+          echo "frontend=${OWNER}/app-qfield-frontend" >> "$GITHUB_OUTPUT"
+          echo "ncclient=${OWNER}/app-qfield-ncclient" >> "$GITHUB_OUTPUT"
+
+      - name: Set version tag
         id: version
         run: |
+          MANUAL="${{ github.event.inputs.version }}"
+          if [ -n "$MANUAL" ]; then
+            echo "version=${MANUAL}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "${{ github.event_name }}" = "workflow_run" ]; then
             if [ "${{ github.event.workflow_run.conclusion }}" != "success" ]; then
-              echo "Binaries workflow did not succeed, skipping"
+              echo "Binaries workflow did not succeed; skipping image build"
+              echo "version=" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            # Resolve version from the commit that triggered the binaries workflow
             SHA="${{ github.event.workflow_run.head_sha }}"
             TAG=$(git describe --tags --exact-match "$SHA" 2>/dev/null || true)
             if [ -n "$TAG" ]; then
-              echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+              echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
             else
-              echo "version=latest" >> $GITHUB_OUTPUT
+              echo "version=latest" >> "$GITHUB_OUTPUT"
             fi
           elif [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
           else
-            echo "version=latest" >> $GITHUB_OUTPUT
+            # main / workflow_dispatch without input
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            echo "version=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           fi
 
   build-backend:
@@ -61,10 +95,12 @@ jobs:
     permissions:
       contents: read
       packages: write
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -80,10 +116,11 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ needs.get-version.outputs.backend_image }}
           tags: |
             type=raw,value=${{ needs.get-version.outputs.version }}
-            type=raw,value=latest,enable=${{ !contains(needs.get-version.outputs.version, '-') }}
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v') }}
+            type=sha,prefix=sha-,format=short
 
       - name: Build and push backend image
         uses: docker/build-push-action@v5
@@ -98,6 +135,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
+          provenance: false
 
   build-frontend:
     name: Build Frontend Image
@@ -107,10 +145,12 @@ jobs:
     permissions:
       contents: read
       packages: write
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -126,10 +166,11 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ needs.get-version.outputs.frontend_image }}
           tags: |
             type=raw,value=${{ needs.get-version.outputs.version }}
-            type=raw,value=latest,enable=${{ !contains(needs.get-version.outputs.version, '-') }}
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v') }}
+            type=sha,prefix=sha-,format=short
 
       - name: Build and push frontend image
         uses: docker/build-push-action@v5
@@ -141,10 +182,11 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ needs.get-version.outputs.version }}
-            DOWNLOAD_BINARIES=${{ needs.get-version.outputs.version != 'latest' && '1' || '0' }}
+            DOWNLOAD_BINARIES=0
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
+          provenance: false
 
   build-ncclient:
     name: Build ncclient Docker Image
@@ -154,10 +196,12 @@ jobs:
     permissions:
       contents: read
       packages: write
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -173,14 +217,17 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.NCCLIENT_IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ needs.get-version.outputs.ncclient_image }}
           tags: |
             type=raw,value=${{ needs.get-version.outputs.version }}
-            type=raw,value=latest,enable=${{ !contains(needs.get-version.outputs.version, '-') }}
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v') }}
+            type=sha,prefix=sha-,format=short
 
-      # client/version.py (see build-ncclient-binaries.yml); "latest" stays a dev build.
       - name: Stamp client version
-        run: python3 client/stamp_version.py "${{ needs.get-version.outputs.version }}"
+        run: |
+          if [ -f client/stamp_version.py ]; then
+            python3 client/stamp_version.py "${{ needs.get-version.outputs.version }}"
+          fi
 
       - name: Build and push ncclient image
         uses: docker/build-push-action@v5
@@ -193,8 +240,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
+          provenance: false
 
-  # Summary job
   summary:
     name: Build Summary
     needs: [get-version, build-backend, build-frontend, build-ncclient]
@@ -202,13 +249,36 @@ jobs:
     if: always() && needs.get-version.outputs.version != ''
     permissions:
       contents: read
+      packages: write
     steps:
-      - name: Check build status
+      - name: Print image refs
         run: |
-          echo "Docker image builds completed!"
-          echo "Version: ${{ needs.get-version.outputs.version }}"
-          echo ""
-          echo "Available at:"
-          echo "  - ghcr.io/nixrtr/nebula-commander-backend:${{ needs.get-version.outputs.version }}"
-          echo "  - ghcr.io/nixrtr/nebula-commander-frontend:${{ needs.get-version.outputs.version }}"
-          echo "  - ghcr.io/nixrtr/nebula-commander-ncclient:${{ needs.get-version.outputs.version }}"
+          V="${{ needs.get-version.outputs.version }}"
+          echo "Docker image builds finished (version=${V})"
+          echo "  ${{ env.REGISTRY }}/${{ needs.get-version.outputs.backend_image }}:${V}"
+          echo "  ${{ env.REGISTRY }}/${{ needs.get-version.outputs.frontend_image }}:${V}"
+          echo "  ${{ env.REGISTRY }}/${{ needs.get-version.outputs.ncclient_image }}:${V}"
+          echo "  (+ :latest on default branch / version tags)"
+
+      # Best-effort: make packages public so anonymous cluster pulls work without a pull secret.
+      - name: Make GHCR packages public (best effort)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OWNER="${{ needs.get-version.outputs.owner }}"
+          for PKG in app-qfield-backend app-qfield-frontend app-qfield-ncclient; do
+            echo "Setting visibility public for ${OWNER}/${PKG}..."
+            if gh api --method PUT \
+              -H "Accept: application/vnd.github+json" \
+              "/orgs/${OWNER}/packages/container/${PKG}/visibility" \
+              -f visibility=public; then
+              echo "  ${PKG}: public (org)"
+            elif gh api --method PUT \
+              -H "Accept: application/vnd.github+json" \
+              "/user/packages/container/${PKG}/visibility" \
+              -f visibility=public; then
+              echo "  ${PKG}: public (user)"
+            else
+              echo "  ${PKG}: visibility update skipped (may need org package admin)"
+            fi
+          done

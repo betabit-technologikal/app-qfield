@@ -253,6 +253,19 @@ export async function updateNetwork(
   });
 }
 
+export interface ResignCertsResult {
+  resigned: number;
+  skipped: number;
+  errors: string[];
+}
+
+/** Re-sign all enrolled host certs so network cert_subnets claims apply. */
+export async function resignNetworkCerts(id: number) {
+  return apiFetch<ResignCertsResult>(`/networks/${id}/resign-certs`, {
+    method: "POST",
+  });
+}
+
 export interface ReauthChallengeResponse {
   challenge: string;
   reauth_url: string;

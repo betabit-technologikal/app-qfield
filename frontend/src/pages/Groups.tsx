@@ -12,7 +12,7 @@ import {
 import { useTheme } from "../contexts/ThemeContext";
 import { useErrorToast } from "../contexts/ToastContext";
 
-const PROTOCOLS: InboundFirewallRule["protocol"][] = ["any", "tcp", "udp", "icmp"];
+const PROTOCOLS: InboundFirewallRule["protocol"][] = ["any", "tcp", "udp", "icmp", "icmpv6"];
 
 const emptyRule = (): InboundFirewallRule => ({
   allowed_group: "",

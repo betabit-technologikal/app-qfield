@@ -35,9 +35,20 @@ def _unsafe_subnets_for_cert(node: Node, network: Network) -> list[str]:
     ]
     node_has_ipv6 = ":" in (node.ip_address or "")
     if network.cert_version == 1 or not node_has_ipv6:
+        dropped = [r for r in routes if ":" in r]
         routes = [r for r in routes if ":" not in r]
+        if dropped:
+            logger.warning(
+                "Dropping IPv6 unsafe_routes from cert for node_id=%s hostname=%r "
+                "ip=%r cert_version=%s (need IPv6 overlay address + cert v2): dropped=%s kept=%s",
+                node.id,
+                node.hostname,
+                node.ip_address,
+                network.cert_version,
+                dropped,
+                routes,
+            )
     return routes
-
 
 class CertManager:
     """Issue and manage Nebula certificates with betterkeys and IP allocation."""
@@ -126,6 +137,7 @@ class CertManager:
                     duration_hours=duration_hours,
                     in_pub=pub_path,
                     subnet_cidr=network.subnet_cidr,
+                    cert_subnets=getattr(network, "cert_subnets", None),
                     allowed_roots=_roots,
                 )
             _check_path_under_roots(out_crt, [Path(settings.cert_store_path)])
@@ -158,6 +170,16 @@ class CertManager:
         ip = await self.ip_allocator.allocate(
             network.id, network.subnet_cidr, suggested_ip
         )
+        logger.info(
+            "create_host_certificate allocate network_id=%s name=%r ip=%s subnet=%s "
+            "groups=%s suggested=%r",
+            network.id,
+            name,
+            ip,
+            network.subnet_cidr,
+            groups or [],
+            suggested_ip,
+        )
 
         base = Path(settings.cert_store_path) / str(network.id) / "hosts"
         base.mkdir(parents=True, exist_ok=True)
@@ -172,19 +194,31 @@ class CertManager:
             ca_crt_tmp.write_text(read_cert_store_file(Path(network.ca_cert_path)))
             ca_key_tmp.write_text(read_cert_store_file(Path(network.ca_key_path)))
             _roots = [Path(settings.cert_store_path), Path(tempfile.gettempdir())]
-            keygen(out_pub=pub_path, out_key=key_path, allowed_roots=_roots)
-            cert_sign(
-                ca_crt_tmp,
-                ca_key_tmp,
-                name=name,
-                ip=ip,
-                out_crt=out_crt_tmp,
-                groups=groups or [],
-                duration_hours=duration_hours,
-                in_pub=pub_path,
-                subnet_cidr=network.subnet_cidr,
-                allowed_roots=_roots,
-            )
+            try:
+                keygen(out_pub=pub_path, out_key=key_path, allowed_roots=_roots)
+                cert_sign(
+                    ca_crt_tmp,
+                    ca_key_tmp,
+                    name=name,
+                    ip=ip,
+                    out_crt=out_crt_tmp,
+                    groups=groups or [],
+                    duration_hours=duration_hours,
+                    in_pub=pub_path,
+                    subnet_cidr=network.subnet_cidr,
+                    cert_subnets=getattr(network, "cert_subnets", None),
+                    allowed_roots=_roots,
+                )
+            except Exception:
+                logger.exception(
+                    "create_host_certificate nebula-cert failed network_id=%s name=%r ip=%s "
+                    "subnet=%s",
+                    network.id,
+                    name,
+                    ip,
+                    network.subnet_cidr,
+                )
+                raise
             cert_pem = out_crt_tmp.read_text()
             private_key_pem = key_path.read_text()
             public_key_pem = pub_path.read_text()
@@ -257,6 +291,7 @@ class CertManager:
                     duration_hours=duration_hours,
                     in_pub=pub_path,
                     subnet_cidr=network.subnet_cidr,
+                    cert_subnets=getattr(network, "cert_subnets", None),
                     unsafe_subnets=_unsafe_subnets_for_cert(node, network),
                     allowed_roots=_roots,
                 )
@@ -327,6 +362,7 @@ class CertManager:
                 duration_hours=duration_hours,
                 in_pub=pub_path,
                 subnet_cidr=network.subnet_cidr,
+                cert_subnets=getattr(network, "cert_subnets", None),
                 unsafe_subnets=_unsafe_subnets_for_cert(node, network),
                 allowed_roots=_roots,
             )

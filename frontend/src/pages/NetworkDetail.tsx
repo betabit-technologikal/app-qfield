@@ -3,7 +3,7 @@ import { useParams, useNavigate, Link } from 'react-router-dom';
 import { Card, Table, Badge, Button, Modal, Label, Select, Checkbox, TextInput } from 'flowbite-react';
 import { HiArrowLeft, HiPlus, HiPencil, HiTrash, HiGlobe, HiChevronDown, HiChevronRight } from 'react-icons/hi';
 import { RequireNetworkOwner } from '../components/permissions/RequireNetworkOwner';
-import { apiClient, listNodes } from '../api/client';
+import { apiClient, listNodes, updateNetwork, resignNetworkCerts } from '../api/client';
 import { isNodeActive } from '../utils/nodeStatus';
 import type { Node } from '../types/nodes';
 import { GroupAccessDiagram } from '../components/GroupAccessDiagram';
@@ -13,6 +13,7 @@ interface NetworkInfo {
   id: number;
   name: string;
   subnet_cidr: string;
+  cert_subnets?: string[];
   cert_curve: "25519" | "P256";
   created_at: string;
   group_count: number;
@@ -68,6 +69,11 @@ export const NetworkDetail: React.FC = () => {
   }>({ open: false, typedName: "", redirecting: false });
   const [deleteError, setDeleteError] = useState<string | null>(null);
 
+  // Cert subnets editor
+  const [certSubnetsDraft, setCertSubnetsDraft] = useState('');
+  const [certSubnetsBusy, setCertSubnetsBusy] = useState(false);
+  const [certSubnetsMsg, setCertSubnetsMsg] = useState<string | null>(null);
+
   const fetchData = useCallback(async () => {
     if (!networkId) return;
     try {
@@ -81,6 +87,7 @@ export const NetworkDetail: React.FC = () => {
       setUsers(usersRes.data);
       setAllUsers(allUsersRes.data);
       setNetwork(networkRes.data);
+      setCertSubnetsDraft((networkRes.data.cert_subnets || []).join(', '));
       setNodes(nodesRes);
     } catch (error) {
       console.error('Failed to fetch data:', error);
@@ -168,6 +175,39 @@ export const NetworkDetail: React.FC = () => {
     }
   };
 
+  const saveCertSubnets = async (andResign: boolean) => {
+    if (!network) return;
+    setCertSubnetsBusy(true);
+    setCertSubnetsMsg(null);
+    const cert_subnets = certSubnetsDraft
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    try {
+      console.info('[network] update cert_subnets', { networkId, cert_subnets, andResign });
+      const updated = await updateNetwork(network.id, { cert_subnets });
+      setNetwork({ ...network, ...updated, cert_subnets: updated.cert_subnets });
+      setCertSubnetsDraft((updated.cert_subnets || []).join(', '));
+      if (andResign) {
+        const result = await resignNetworkCerts(network.id);
+        console.info('[network] resign-certs result', result);
+        setCertSubnetsMsg(
+          `Saved. Re-signed ${result.resigned} cert(s), skipped ${result.skipped}` +
+            (result.errors.length ? `; errors: ${result.errors.join('; ')}` : '.')
+        );
+      } else {
+        setCertSubnetsMsg(
+          'Saved. Existing host certs still carry old claims until you re-sign them.'
+        );
+      }
+    } catch (e: any) {
+      console.error('[network] cert_subnets update failed', e);
+      setCertSubnetsMsg(e?.response?.data?.detail || e?.message || 'Failed to update cert subnets');
+    } finally {
+      setCertSubnetsBusy(false);
+    }
+  };
+
   const startDeleteNetwork = async () => {
     if (!network || deleteModal.typedName.trim() !== network.name.trim()) return;
     setDeleteError(null);
@@ -206,7 +246,15 @@ export const NetworkDetail: React.FC = () => {
             <h1 className="text-3xl font-bold">{network?.name || 'Network'}</h1>
             {network && (
               <p className="mt-2 text-gray-600 dark:text-gray-400">
-                Subnet: <strong>{network.subnet_cidr}</strong> &middot; Curve:{' '}
+                Allocation: <strong>{network.subnet_cidr}</strong>
+                {network.cert_subnets?.length ? (
+                  <>
+                    {' '}
+                    &middot; Cert subnets:{' '}
+                    <strong>{network.cert_subnets.join(', ')}</strong>
+                  </>
+                ) : null}{' '}
+                &middot; Curve:{' '}
                 <strong>{network.cert_curve === 'P256' ? 'P256' : 'Curve25519'}</strong> &middot; Created{' '}
                 {new Date(network.created_at).toLocaleDateString()}
               </p>
@@ -224,6 +272,46 @@ export const NetworkDetail: React.FC = () => {
             Manage DNS
           </Link>
         </div>
+
+        {network && (
+          <Card className="mb-6">
+            <h2 className="text-lg font-semibold mb-2">Cert subnets (mesh L3)</h2>
+            <p className="mb-3 text-sm text-gray-600 dark:text-gray-400">
+              CIDRs embedded in every host certificate so peers share VPN networks beyond the
+              allocation pool. Default is expansive ULA <code className="text-xs">fd00::/8</code>.
+              Changing claims requires re-signing host certs for existing nodes.
+            </p>
+            <Label htmlFor="cert_subnets_edit" value="Comma-separated CIDRs" />
+            <TextInput
+              id="cert_subnets_edit"
+              value={certSubnetsDraft}
+              onChange={(e) => setCertSubnetsDraft(e.target.value)}
+              placeholder="fd00::/8"
+              disabled={certSubnetsBusy}
+            />
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button
+                color="purple"
+                size="sm"
+                disabled={certSubnetsBusy}
+                onClick={() => saveCertSubnets(true)}
+              >
+                Save &amp; re-sign all host certs
+              </Button>
+              <Button
+                color="gray"
+                size="sm"
+                disabled={certSubnetsBusy}
+                onClick={() => saveCertSubnets(false)}
+              >
+                Save only
+              </Button>
+            </div>
+            {certSubnetsMsg && (
+              <p className="mt-2 text-sm text-gray-700 dark:text-gray-300">{certSubnetsMsg}</p>
+            )}
+          </Card>
+        )}
 
         {loading ? (
           <Card>

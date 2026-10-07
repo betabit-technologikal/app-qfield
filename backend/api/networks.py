@@ -23,10 +23,18 @@ from ..models import (
     NetworkGroupFirewall,
     NetworkPermission,
     NetworkSettings,
+    Node,
     User,
 )
 from ..services.audit import get_client_ip, log_audit
+from ..services.cert_manager import CertManager
+from ..services.cert_networks import (
+    DEFAULT_CERT_SUBNETS,
+    effective_cert_subnets,
+    validate_cert_subnets,
+)
 from ..services.ip_allocator import IPAllocator
+from ..services.overlay_cidr import validate_allocation_cidr
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +45,23 @@ class NetworkCreate(BaseModel):
     name: str
     subnet_cidr: str
     cert_curve: Literal["25519", "P256"] = "25519"
+    # CIDRs baked into every host cert; omit/null -> default expansive ULA fd00::/8.
+    cert_subnets: Optional[List[str]] = None
+
+    def validated_subnet_cidr(self) -> str:
+        return validate_allocation_cidr(self.subnet_cidr)
+
+    def validated_cert_subnets(self) -> list[str]:
+        if self.cert_subnets is None:
+            return list(DEFAULT_CERT_SUBNETS)
+        return validate_cert_subnets(self.cert_subnets)
 
 
 class NetworkResponse(BaseModel):
     id: int
     name: str
     subnet_cidr: str
+    cert_subnets: List[str] = DEFAULT_CERT_SUBNETS
     ca_cert_path: Optional[str] = None
     cert_version: int = 2
     cert_curve: str = "25519"
@@ -64,6 +83,10 @@ class NetworkListResponse(NetworkResponse):
     can_manage_nodes: Optional[bool] = None
     can_invite_users: Optional[bool] = None
     can_manage_firewall: Optional[bool] = None
+
+
+def _cert_subnets_for_response(network: Network) -> list[str]:
+    return effective_cert_subnets(getattr(network, "cert_subnets", None))
 
 
 async def _get_network_counts(
@@ -95,6 +118,8 @@ async def _get_network_counts(
 class NetworkUpdate(BaseModel):
     """No network-level firewall (defined.net style: only per-group inbound rules)."""
     name: Optional[str] = None  # If set, must be unique across all networks
+    # When set, host certs must be re-signed (UI/API bulk resign) for claims to take effect.
+    cert_subnets: Optional[List[str]] = None
 
 
 @router.get("", response_model=list[NetworkListResponse])
@@ -128,6 +153,7 @@ async def list_networks(
                 id=n.id,
                 name=n.name,
                 subnet_cidr=n.subnet_cidr,
+                cert_subnets=_cert_subnets_for_response(n),
                 ca_cert_path=None,  # Redacted for system admins
                 cert_version=n.cert_version,
                 cert_curve=n.cert_curve,
@@ -167,6 +193,7 @@ async def list_networks(
             id=n.id,
             name=n.name,
             subnet_cidr=n.subnet_cidr,
+            cert_subnets=_cert_subnets_for_response(n),
             ca_cert_path=n.ca_cert_path,
             cert_version=n.cert_version,
             cert_curve=n.cert_curve,
@@ -215,7 +242,33 @@ async def create_network(
     # networks migrated in by the DB column's SQL-level DEFAULT); cert_curve is the one
     # user-facing choice, made once here and immutable afterward (nebula requires every
     # cert on a network to share its CA's curve).
-    network = Network(name=body.name, subnet_cidr=body.subnet_cidr, cert_curve=body.cert_curve)
+    try:
+        subnet_cidr = body.validated_subnet_cidr()
+        cert_subnets = body.validated_cert_subnets()
+    except ValueError as e:
+        logger.error(
+            "create_network rejected name=%r subnet_cidr=%r cert_subnets=%r actor=%s: %s",
+            body.name,
+            body.subnet_cidr,
+            body.cert_subnets,
+            user.email or user.sub,
+            e,
+        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    logger.info(
+        "create_network name=%r subnet_cidr=%s cert_subnets=%s cert_curve=%s actor=%s",
+        body.name,
+        subnet_cidr,
+        cert_subnets,
+        body.cert_curve,
+        user.email or user.sub,
+    )
+    network = Network(
+        name=body.name,
+        subnet_cidr=subnet_cidr,
+        cert_subnets=cert_subnets,
+        cert_curve=body.cert_curve,
+    )
     session.add(network)
     await session.flush()
     await session.refresh(network)
@@ -265,6 +318,7 @@ async def create_network(
         id=network.id,
         name=network.name,
         subnet_cidr=network.subnet_cidr,
+        cert_subnets=_cert_subnets_for_response(network),
         ca_cert_path=network.ca_cert_path,
         cert_version=network.cert_version,
         cert_curve=network.cert_curve,
@@ -322,6 +376,7 @@ async def get_network(
         id=network.id,
         name=network.name,
         subnet_cidr=network.subnet_cidr,
+        cert_subnets=_cert_subnets_for_response(network),
         ca_cert_path=ca_cert_path,
         cert_version=network.cert_version,
         cert_curve=network.cert_curve,
@@ -383,6 +438,32 @@ async def update_network(
             network.name = new_name
             await session.flush()
 
+    if body.cert_subnets is not None:
+        try:
+            new_cert_subnets = validate_cert_subnets(body.cert_subnets)
+        except ValueError as e:
+            logger.error(
+                "update_network rejected cert_subnets network_id=%s value=%r: %s",
+                network_id,
+                body.cert_subnets,
+                e,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+            ) from e
+        old_cert_subnets = _cert_subnets_for_response(network)
+        if new_cert_subnets != old_cert_subnets:
+            changed["cert_subnets"] = (old_cert_subnets, new_cert_subnets)
+            network.cert_subnets = new_cert_subnets
+            logger.info(
+                "update_network cert_subnets network_id=%s %s -> %s "
+                "(host certs must be re-signed for claims to apply)",
+                network_id,
+                old_cert_subnets,
+                new_cert_subnets,
+            )
+            await session.flush()
+
     await session.refresh(network)
 
     details = {"changed": changed} if changed else None
@@ -400,12 +481,110 @@ async def update_network(
         id=network.id,
         name=network.name,
         subnet_cidr=network.subnet_cidr,
+        cert_subnets=_cert_subnets_for_response(network),
         ca_cert_path=network.ca_cert_path,
         cert_version=network.cert_version,
         cert_curve=network.cert_curve,
         created_at=network.created_at.isoformat() if network.created_at else "",
         **(await _get_network_counts(session, [network.id]))[network.id],
     )
+
+
+class ResignCertsResponse(BaseModel):
+    resigned: int
+    skipped: int
+    errors: List[str] = []
+
+
+@router.post(
+    "/{network_id}/resign-certs",
+    response_model=ResignCertsResponse,
+)
+async def resign_network_certs(
+    network_id: int,
+    request: Request,
+    user: UserInfo = Depends(require_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Re-sign every enrolled host certificate on this network so current cert_subnets
+    (and groups/unsafe routes) are embedded. Devices pick up new certs on next poll.
+    Owner only.
+    """
+    result = await session.execute(select(Network).where(Network.id == network_id))
+    network = result.scalar_one_or_none()
+    if not network:
+        raise HTTPException(status_code=404, detail="Network not found")
+
+    user_result = await session.execute(select(User).where(User.oidc_sub == user.sub))
+    db_user = user_result.scalar_one_or_none()
+    if not db_user:
+        raise HTTPException(status_code=403, detail="User not found")
+
+    has_permission = await check_network_permission(
+        db_user.id, network_id, "owner", session
+    )
+    if not has_permission:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only network owners can re-sign host certificates",
+        )
+
+    nodes_result = await session.execute(
+        select(Node).where(Node.network_id == network_id).order_by(Node.id)
+    )
+    nodes = list(nodes_result.scalars().all())
+    cert_manager = CertManager(session)
+    resigned = 0
+    skipped = 0
+    errors: list[str] = []
+
+    logger.info(
+        "resign_network_certs start network_id=%s nodes=%s cert_subnets=%s actor=%s",
+        network_id,
+        len(nodes),
+        _cert_subnets_for_response(network),
+        user.email or user.sub,
+    )
+    for node in nodes:
+        if not node.public_key or not node.ip_address:
+            skipped += 1
+            continue
+        try:
+            await cert_manager.resign_host_certificate(node, network)
+            resigned += 1
+        except Exception as e:
+            logger.exception(
+                "resign_network_certs failed network_id=%s node_id=%s hostname=%r",
+                network_id,
+                node.id,
+                node.hostname,
+            )
+            errors.append(f"{node.hostname or node.id}: {e}")
+
+    await log_audit(
+        session,
+        "network_certs_resigned",
+        resource_type="network",
+        resource_id=network_id,
+        actor_user_id=db_user.id,
+        actor_identifier=db_user.email or user.sub,
+        client_ip=get_client_ip(request),
+        details={
+            "resigned": resigned,
+            "skipped": skipped,
+            "error_count": len(errors),
+            "cert_subnets": _cert_subnets_for_response(network),
+        },
+    )
+    logger.info(
+        "resign_network_certs done network_id=%s resigned=%s skipped=%s errors=%s",
+        network_id,
+        resigned,
+        skipped,
+        len(errors),
+    )
+    return ResignCertsResponse(resigned=resigned, skipped=skipped, errors=errors)
 
 
 class NetworkDeleteRequest(BaseModel):
@@ -491,7 +670,7 @@ async def delete_network(
 
 
 # Defined.net-style: only inbound rules per group. Rule shape: allowed_group, protocol, port_range, description.
-VALID_INBOUND_PROTOS = ("any", "tcp", "udp", "icmp")
+VALID_INBOUND_PROTOS = ("any", "tcp", "udp", "icmp", "icmpv6")
 
 
 def _validate_inbound_rule(rule: dict) -> None:

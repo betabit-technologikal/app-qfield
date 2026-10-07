@@ -129,6 +129,9 @@ def _run_sqlite_migrations() -> None:
             # from the ORM-level default/explicit value on INSERT instead of this SQL default.
             ("cert_version", "ALTER TABLE networks ADD COLUMN cert_version INTEGER DEFAULT 1"),
             ("cert_curve", "ALTER TABLE networks ADD COLUMN cert_curve VARCHAR(16) DEFAULT '25519'"),
+            # JSON list of CIDRs embedded in every host cert; NULL means "use default fd00::/8"
+            # at read/sign time (see cert_manager.effective_cert_subnets).
+            ("cert_subnets", "ALTER TABLE networks ADD COLUMN cert_subnets TEXT"),
         ]:
             if col not in network_columns:
                 cur.execute(sql)

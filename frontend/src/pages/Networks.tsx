@@ -8,6 +8,26 @@ import { listNetworks, listNodes, createNetwork } from "../api/client";
 import { isNodeActive } from "../utils/nodeStatus";
 import { useErrorToast } from "../contexts/ToastContext";
 
+/** Random ULA /64 for opinionated IPv6-first network create (fd + 40-bit id + 16-bit subnet). */
+function randomUla64(): string {
+  const bytes = new Uint8Array(7);
+  crypto.getRandomValues(bytes);
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  // fd + 40 bits (10 hex) + 16 bits (4 hex) → /64
+  const g = hex.slice(0, 10);
+  const s = hex.slice(10, 14);
+  return `fd${g.slice(0, 2)}:${g.slice(2, 6)}:${g.slice(6, 10)}:${s}::/64`;
+}
+
+function blankNetworkForm(): NetworkCreate {
+  return {
+    name: "",
+    subnet_cidr: randomUla64(),
+    cert_curve: "25519",
+    cert_subnets: ["fd00::/8"],
+  };
+}
+
 export function Networks() {
   const navigate = useNavigate();
   const [networks, setNetworks] = useState<Network[]>([]);
@@ -15,12 +35,7 @@ export function Networks() {
   const [loading, setLoading] = useState(true);
   const setError = useErrorToast();
   const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState<NetworkCreate>({
-    name: "",
-    subnet_cidr: "10.100.0.0/24",
-    cert_curve: "25519",
-  });
-
+  const [form, setForm] = useState<NetworkCreate>(blankNetworkForm);
   const load = useCallback(() => {
     setLoading(true);
     Promise.all([listNetworks(), listNodes()])
@@ -39,13 +54,28 @@ export function Networks() {
 
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    createNetwork(form)
-      .then(() => {
-        setForm({ name: "", subnet_cidr: "10.100.0.0/24", cert_curve: "25519" });
+    const cert_subnets = (form.cert_subnets ?? [])
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const payload: NetworkCreate = {
+      ...form,
+      cert_subnets: cert_subnets.length ? cert_subnets : ["fd00::/8"],
+    };
+    console.info("[networks] create_network request", payload);
+    createNetwork(payload)
+      .then((created) => {
+        console.info("[networks] create_network ok", created);
+        setForm(blankNetworkForm());
         setShowForm(false);
         load();
       })
-      .catch((e) => setError(e.message));
+      .catch((err) => {
+        console.error("[networks] create_network failed", {
+          ...payload,
+          error: err?.message ?? err,
+        });
+        setError(err.message);
+      });
   };
 
   const nodeCounts = (networkId: number): { active: number; total: number } => {
@@ -83,15 +113,43 @@ export function Networks() {
               />
             </div>
             <div>
-              <Label htmlFor="subnet" value="Subnet CIDR" />
+              <Label htmlFor="subnet" value="Allocation CIDR (IPv6 overlay)" />
               <TextInput
                 id="subnet"
                 type="text"
                 value={form.subnet_cidr}
                 onChange={(e) => setForm((f) => ({ ...f, subnet_cidr: e.target.value }))}
-                placeholder="10.100.0.0/24"
+                placeholder="fd00:abcd:ef01:2345::/64"
                 required
               />
+              <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
+                IPv6 prefix used to assign each node a tunnel address. Default is a random ULA /64.
+                Allowed prefix lengths: /8 through /96 (nothing tighter than /96).
+              </p>
+            </div>
+            <div>
+              <Label htmlFor="cert_subnets" value="Cert subnets (mesh L3 claims)" />
+              <TextInput
+                id="cert_subnets"
+                type="text"
+                value={(form.cert_subnets ?? []).join(", ")}
+                onChange={(e) =>
+                  setForm((f) => ({
+                    ...f,
+                    cert_subnets: e.target.value
+                      .split(",")
+                      .map((s) => s.trim())
+                      .filter(Boolean),
+                  }))
+                }
+                placeholder="fd00::/8"
+              />
+              <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
+                Comma-separated CIDRs baked into every host certificate so peers share VPN
+                networks beyond the allocation pool. Default expansive ULA is{" "}
+                <code className="text-xs">fd00::/8</code>. Security is host/Nebula firewall +
+                FRR, not narrow cert prefixes.
+              </p>
             </div>
             <div>
               <Label htmlFor="cert_curve" value="Certificate Curve" />
@@ -126,7 +184,7 @@ export function Networks() {
             <div className="p-8 text-center">
               <p className="text-gray-500 dark:text-gray-400 mb-2">No networks yet.</p>
               <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
-                Create a network to define your overlay subnet. Configure per-group firewall rules on the Groups page.
+                Create an IPv6 overlay network (ULA allocation CIDR). Configure per-group firewall rules on the Groups page.
               </p>
               <Button color="purple" onClick={() => setShowForm(true)} data-onboarding-target="networks-create-button">
                 <HiPlus className="mr-2 h-5 w-5" />
