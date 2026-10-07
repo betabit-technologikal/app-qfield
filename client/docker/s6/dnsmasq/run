@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+
+set -eu
+
+SERVER="${NEBULA_COMMANDER_SERVER:-}"
+POLL_INTERVAL="${NEBULA_DNS_POLL_INTERVAL:-60}"
+OUTPUT_DIR="${NEBULA_OUTPUT_DIR:-/etc/nebula}"
+TOKEN_FILE="${NEBULA_DEVICE_TOKEN_FILE:-/etc/nebula-commander/token}"
+
+if [ -z "${SERVER}" ]; then
+  echo "NEBULA_COMMANDER_SERVER is required" >&2
+  exit 1
+fi
+
+CONFIG_YAML="${OUTPUT_DIR%/}/config.yaml"
+DNSMASQ_CONF="/etc/dnsmasq.d/nebula.conf"
+ETAG=""
+DNSMASQ_PID=""
+
+is_lighthouse_from_config() {
+  local path="$1"
+  [ -f "${path}" ] && grep -q "am_lighthouse: true" "${path}"
+}
+
+# Wait until the listen-address IP from dnsmasq config is assigned (e.g. by Nebula).
+# Avoids "Cannot assign requested address" when dnsmasq starts before the Nebula interface is up.
+wait_for_listen_address() {
+  local conf="$1"
+  local listen_ip
+  listen_ip="$(grep -m1 '^listen-address=' "${conf}" 2>/dev/null | sed 's/^listen-address=//')"
+  if [ -z "${listen_ip}" ]; then
+    return 0
+  fi
+  local max_wait=90
+  local waited=0
+  while [ "${waited}" -lt "${max_wait}" ]; do
+    if ip -4 addr show 2>/dev/null | grep -q "inet ${listen_ip}/"; then
+      return 0
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  echo "Warning: listen-address ${listen_ip} not assigned after ${max_wait}s; dnsmasq may fail to bind." >&2
+  return 0
+}
+
+restart_dnsmasq() {
+  local conf="$1"
+  wait_for_listen_address "${conf}"
+  # Stop any existing dnsmasq instance in the container namespace.
+  pkill dnsmasq 2>/dev/null || true
+  # Run dnsmasq in the foreground so all logs go to the container logs.
+  dnsmasq --no-daemon --conf-file="${conf}" &
+  DNSMASQ_PID=$!
+}
+
+cleanup() {
+  if [ -n "${DNSMASQ_PID:-}" ] && kill -0 "${DNSMASQ_PID}" 2>/dev/null; then
+    kill "${DNSMASQ_PID}" 2>/dev/null || true
+  fi
+  exit 0
+}
+trap cleanup TERM INT
+
+while true; do
+  LIGHTHOUSE=0
+  if [ "${SERVE_DNS:-}" != "" ]; then
+    SERVE_DNS_VALUE="$(printf '%s' "${SERVE_DNS}" | tr '[:upper:]' '[:lower:]')"
+  else
+    SERVE_DNS_VALUE="0"
+  fi
+  case "${SERVE_DNS_VALUE}" in
+    1|true|yes|on) SERVE_DNS_INT=1 ;;
+    *) SERVE_DNS_INT=0 ;;
+  esac
+
+  if [ "${SERVE_DNS_INT}" -eq 1 ] && is_lighthouse_from_config "${CONFIG_YAML}"; then
+    LIGHTHOUSE=1
+  fi
+
+  if [ "${LIGHTHOUSE}" -ne 1 ]; then
+    # Ensure dnsmasq is not running when this node is not a lighthouse.
+    if [ -n "${DNSMASQ_PID:-}" ] && kill -0 "${DNSMASQ_PID}" 2>/dev/null; then
+      kill "${DNSMASQ_PID}" 2>/dev/null || true
+      wait "${DNSMASQ_PID}" 2>/dev/null || true
+    fi
+    DNSMASQ_PID=""
+    sleep "${POLL_INTERVAL}"
+    continue
+  fi
+
+  if [ ! -f "${TOKEN_FILE}" ]; then
+    echo "DNS poll: token file ${TOKEN_FILE} not found yet; waiting..." >&2
+    sleep "${POLL_INTERVAL}"
+    continue
+  fi
+
+  URL="${SERVER%/}/api/device/dnsmasq.conf"
+  TMP_HEADERS="$(mktemp)"
+  TMP_BODY="$(mktemp)"
+
+  CURL_ARGS="-sS -D \"${TMP_HEADERS}\" -o \"${TMP_BODY}\" --max-time 30"
+  TOKEN="$(tr -d '\n\r' < "${TOKEN_FILE}")"
+  if [ -n "${TOKEN}" ]; then
+    CURL_ARGS="${CURL_ARGS} -H \"Authorization: Bearer ${TOKEN}\""
+  fi
+  if [ -n "${ETAG}" ]; then
+    CURL_ARGS="${CURL_ARGS} -H \"If-None-Match: \\\"${ETAG}\\\"\""
+  fi
+
+  # shellcheck disable=SC2086
+  HTTP_CODE="$(sh -c "curl ${CURL_ARGS} -w '%{http_code}' \"${URL}\"" || echo "000")"
+
+  if [ "${HTTP_CODE}" = "000" ]; then
+    echo "DNS poll error: curl failed" >&2
+    rm -f "${TMP_HEADERS}" "${TMP_BODY}"
+    sleep "${POLL_INTERVAL}"
+    continue
+  fi
+
+  if [ "${HTTP_CODE}" = "304" ]; then
+    # Config unchanged (ETag match). If we already have a config file and dnsmasq
+    # is not running, restart it so it recovers from prior failures.
+    rm -f "${TMP_HEADERS}" "${TMP_BODY}"
+    if [ -f "${DNSMASQ_CONF}" ]; then
+      if [ -z "${DNSMASQ_PID:-}" ] || ! kill -0 "${DNSMASQ_PID}" 2>/dev/null; then
+        echo "DNS config unchanged (304); restarting dnsmasq with existing config."
+        restart_dnsmasq "${DNSMASQ_CONF}"
+      fi
+    fi
+    sleep "${POLL_INTERVAL}"
+    continue
+  fi
+
+  if [ "${HTTP_CODE}" != "200" ]; then
+    echo "DNS poll failed: HTTP ${HTTP_CODE} $(head -c 200 "${TMP_BODY}" 2>/dev/null)" >&2
+    rm -f "${TMP_HEADERS}" "${TMP_BODY}"
+    sleep "${POLL_INTERVAL}"
+    continue
+  fi
+
+  # Extract ETag header if present
+  ETAG_LINE="$(grep -i '^etag:' "${TMP_HEADERS}" | tail -n 1 || true)"
+  if [ -n "${ETAG_LINE}" ]; then
+    ETAG="$(printf '%s' "${ETAG_LINE#*:}" | tr -d ' \"\r\n')"
+  fi
+
+  CONTENT="$(cat "${TMP_BODY}")"
+  rm -f "${TMP_HEADERS}" "${TMP_BODY}"
+
+  mkdir -p "$(dirname "${DNSMASQ_CONF}")"
+  printf '%s\n' "${CONTENT}" > "${DNSMASQ_CONF}"
+
+  # Always ensure dnsmasq is running with the latest config. If it's not running,
+  # restart it; if it is already running, leave it alone to avoid unnecessary restarts.
+  if [ -z "${DNSMASQ_PID:-}" ] || ! kill -0 "${DNSMASQ_PID}" 2>/dev/null; then
+    echo "Starting dnsmasq with updated config."
+    restart_dnsmasq "${DNSMASQ_CONF}"
+  fi
+
+  sleep "${POLL_INTERVAL}"
+done
+

@@ -1,0 +1,72 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    # Creates /var/lib/ncclient per usr/lib/tmpfiles.d/ncclient.conf immediately,
+    # rather than waiting for the next boot.
+    if command -v systemd-tmpfiles >/dev/null; then
+        systemd-tmpfiles --create /usr/lib/tmpfiles.d/ncclient.conf || true
+    fi
+
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+    fi
+
+    # polkitd and dbus-daemon both only read their respective policy
+    # directories (rules.d/, actions/, system.d/) at their OWN startup -
+    # neither notices this package dropping new files in on its own, so
+    # without an explicit reload, a polkitd/dbus-daemon that was already
+    # running before this package installed (the common case: both start at
+    # boot, this package installs later) keeps using stale in-memory state
+    # forever (until the next reboot or manual restart), never picking up
+    # org.nixrtr.nebulacommander.rules /
+    # org.beardedtek.NebulaCommander1.policy / the new dbus system.d
+    # policy. Confirmed hitting exactly the polkit half of this during
+    # development: the desktop app's Start/Stop/Restart buttons hung for
+    # ~15s (service_control.py's own subprocess timeout) waiting on an
+    # interactive auth prompt nobody was there to answer, because the
+    # running polkitd hadn't picked up the new rule. `reload` rescans
+    # immediately without dropping any in-flight sessions/agents the way a
+    # full restart would.
+    # `reload` alone isn't enough here: confirmed directly that Debian 12's
+    # polkit.service ships no ExecReload= at all (unlike Debian 13's, which
+    # does) - `systemctl reload polkit` fails outright there with "Job type
+    # reload is not applicable", silently leaving the stale rule cache in
+    # place exactly as if this whole block were absent. `try-restart` is
+    # the fallback that works everywhere (only restarts if already
+    # running, which the is-active guard already establishes).
+    if [ -d /run/systemd/system ] && systemctl is-active --quiet polkit; then
+        systemctl reload polkit 2>/dev/null || systemctl try-restart polkit || true
+    fi
+    if [ -d /run/systemd/system ] && systemctl is-active --quiet dbus; then
+        systemctl reload dbus || true
+    fi
+
+
+    # Upgrades: restart a running ncclient so the NEW binary (and its D-Bus
+    # API) takes over immediately. Without this the pre-upgrade process kept
+    # running until the next reboot - confirmed on Debian 13 while testing
+    # 0.6.3 -> 0.6.10, where the old process went on serving the node's
+    # unredacted private key and old authorization messages after the
+    # package (and its polkit rule) had already been upgraded.
+    if [ -d /run/systemd/system ]; then
+        systemctl try-restart ncclient.service || true
+    fi
+
+    # $2 (the previously configured version) is empty on a fresh install.
+    if [ -z "$2" ]; then
+        echo ""
+        echo "Nebula Commander service installed but not started."
+        echo "Next steps:"
+        echo "  1. Set NEBULA_COMMANDER_SERVER in /etc/default/ncclient, then enroll:"
+        echo "       sudo ncclient enroll --server https://your-server --code YOUR-CODE"
+        echo "     (or enroll via the nebula-commander-desktop app instead)"
+        echo "  2. sudo systemctl enable --now ncclient"
+        echo ""
+        echo "In the nebula-commander-desktop app (if installed), any local user can"
+        echo "view status; changes need membership in the sudo or wheel group."
+        echo ""
+    fi
+fi
+
+exit 0

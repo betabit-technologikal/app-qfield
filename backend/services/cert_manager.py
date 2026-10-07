@@ -1,0 +1,367 @@
+"""
+Certificate management: CA creation, signing with betterkeys (client public key),
+and full certificate creation (server-generated keypair).
+"""
+import tempfile
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..config import settings
+from ..models import Network, Node, Certificate, AllocatedIP
+from ..utils.nebula_cert import _check_path_under_roots, ca_generate, cert_sign, keygen
+from .cert_store import read_cert_store_file, write_cert_store_file
+from .ip_allocator import IPAllocator
+from .revocation import block_host_cert_file, unblock_issued_cert
+
+logger = logging.getLogger(__name__)
+
+
+def _unsafe_subnets_for_cert(node: Node, network: Network) -> list[str]:
+    """CIDRs this node advertises as a subnet-router/exit-node gateway, for the cert's
+    -subnets claim. nebula-cert refuses IPv6 unsafe networks on a host without an IPv6
+    address of its own ("IPv6 unsafe networks require an IPv6 address assignment"), and
+    v1 certs can't hold IPv6 at all - so ::/0 (every exit node advertises it) and other
+    IPv6 routes are dropped for IPv4-addressed nodes rather than failing the whole sign.
+    They simply won't route; the IPv4 routes still do."""
+    routes = [
+        str(r.get("route") or "").strip()
+        for r in (node.unsafe_routes or [])
+        if r.get("route")
+    ]
+    node_has_ipv6 = ":" in (node.ip_address or "")
+    if network.cert_version == 1 or not node_has_ipv6:
+        routes = [r for r in routes if ":" not in r]
+    return routes
+
+
+class CertManager:
+    """Issue and manage Nebula certificates with betterkeys and IP allocation."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+        self.ip_allocator = IPAllocator(session)
+
+    async def ensure_ca(self, network: Network) -> None:
+        """Create CA for the network if not already present."""
+        if network.ca_cert_path and Path(network.ca_cert_path).exists():
+            return
+        base = Path(settings.cert_store_path) / str(network.id)
+        base.mkdir(parents=True, exist_ok=True)
+        ca_crt = base / "ca.crt"
+        ca_key = base / "ca.key"
+        # nebula-cert refuses to overwrite existing CA files; use them if present (e.g. volume persisted, DB reset)
+        if ca_crt.exists() and ca_key.exists():
+            network.ca_cert_path = str(ca_crt)
+            network.ca_key_path = str(ca_key)
+            await self.session.flush()
+            return
+        _cert_store_root = Path(settings.cert_store_path)
+        ca_generate(
+            network.name,
+            ca_crt,
+            ca_key,
+            version=network.cert_version,
+            curve=network.cert_curve,
+            allowed_roots=[_cert_store_root],
+        )
+        # Overwrite with encrypted storage
+        write_cert_store_file(ca_crt, ca_crt.read_text())
+        write_cert_store_file(ca_key, ca_key.read_text())
+        network.ca_cert_path = str(ca_crt)
+        network.ca_key_path = str(ca_key)
+        await self.session.flush()
+
+    async def sign_host(
+        self,
+        network: Network,
+        name: str,
+        public_key_pem: str,
+        groups: Optional[list[str]] = None,
+        suggested_ip: Optional[str] = None,
+        duration_days: Optional[int] = None,
+    ) -> tuple[str, str]:
+        """
+        Sign a host certificate (betterkeys: client sends only public key).
+        Returns (ip_address, cert_pem).
+        """
+        await self.ensure_ca(network)
+        duration_days = duration_days or settings.default_cert_expiry_days
+        duration_hours = duration_days * 24
+
+        ip = await self.ip_allocator.allocate(
+            network.id, network.subnet_cidr, suggested_ip
+        )
+
+        base = Path(settings.cert_store_path) / str(network.id) / "hosts"
+        base.mkdir(parents=True, exist_ok=True)
+        out_crt = base / f"{name}.crt"
+        # Any certificate this replaces must stop being trusted (see revocation.py).
+        await block_host_cert_file(self.session, network.id, name, "superseded")
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".pub", delete=False
+        ) as f:
+            f.write(public_key_pem)
+            pub_path = Path(f.name)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                ca_crt_tmp = tmp / "ca.crt"
+                ca_key_tmp = tmp / "ca.key"
+                ca_crt_tmp.write_text(read_cert_store_file(Path(network.ca_cert_path)))
+                ca_key_tmp.write_text(read_cert_store_file(Path(network.ca_key_path)))
+                _roots = [Path(settings.cert_store_path), Path(tempfile.gettempdir())]
+                cert_sign(
+                    ca_crt_tmp,
+                    ca_key_tmp,
+                    name=name,
+                    ip=ip,
+                    out_crt=out_crt,
+                    groups=groups or [],
+                    duration_hours=duration_hours,
+                    in_pub=pub_path,
+                    subnet_cidr=network.subnet_cidr,
+                    allowed_roots=_roots,
+                )
+            _check_path_under_roots(out_crt, [Path(settings.cert_store_path)])
+            cert_pem = out_crt.read_text()  # lgtm [py/path-injection] Path validated above.
+            write_cert_store_file(out_crt, cert_pem)
+            await unblock_issued_cert(self.session, network.id, cert_pem)
+        finally:
+            pub_path.unlink(missing_ok=True)
+
+        return ip, cert_pem
+
+    async def create_host_certificate(
+        self,
+        network: Network,
+        name: str,
+        groups: Optional[list[str]] = None,
+        suggested_ip: Optional[str] = None,
+        duration_days: Optional[int] = None,
+    ) -> tuple[str, str, str, str, str]:
+        """
+        Create a host certificate by generating a keypair on the server, signing it,
+        and returning (ip_address, cert_pem, private_key_pem, ca_pem, public_key_pem).
+        The private key is also stored on the server and served in the device bundle
+        and node certs zip; it is still returned once in the API response.
+        """
+        await self.ensure_ca(network)
+        duration_days = duration_days or settings.default_cert_expiry_days
+        duration_hours = duration_days * 24
+
+        ip = await self.ip_allocator.allocate(
+            network.id, network.subnet_cidr, suggested_ip
+        )
+
+        base = Path(settings.cert_store_path) / str(network.id) / "hosts"
+        base.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pub_path = tmp / "host.pub"
+            key_path = tmp / "host.key"
+            out_crt_tmp = tmp / "host.crt"
+            ca_crt_tmp = tmp / "ca.crt"
+            ca_key_tmp = tmp / "ca.key"
+            ca_crt_tmp.write_text(read_cert_store_file(Path(network.ca_cert_path)))
+            ca_key_tmp.write_text(read_cert_store_file(Path(network.ca_key_path)))
+            _roots = [Path(settings.cert_store_path), Path(tempfile.gettempdir())]
+            keygen(out_pub=pub_path, out_key=key_path, allowed_roots=_roots)
+            cert_sign(
+                ca_crt_tmp,
+                ca_key_tmp,
+                name=name,
+                ip=ip,
+                out_crt=out_crt_tmp,
+                groups=groups or [],
+                duration_hours=duration_hours,
+                in_pub=pub_path,
+                subnet_cidr=network.subnet_cidr,
+                allowed_roots=_roots,
+            )
+            cert_pem = out_crt_tmp.read_text()
+            private_key_pem = key_path.read_text()
+            public_key_pem = pub_path.read_text()
+
+        # Persist encrypted - blocklisting any certificate this replaces first
+        await block_host_cert_file(self.session, network.id, name, "superseded")
+        write_cert_store_file(base / f"{name}.crt", cert_pem)
+        await unblock_issued_cert(self.session, network.id, cert_pem)
+        key_file = base / f"{name}.key"
+        write_cert_store_file(key_file, private_key_pem)
+
+        ca_pem = ""
+        if network.ca_cert_path:
+            try:
+                ca_pem = read_cert_store_file(Path(network.ca_cert_path))
+            except FileNotFoundError:
+                logger.warning("CA cert file not found: %s", network.ca_cert_path)
+            except PermissionError:
+                logger.error("Permission denied reading CA cert: %s", network.ca_cert_path)
+            except Exception as e:
+                logger.error("Unexpected error reading CA cert from %s: %s", network.ca_cert_path, e)
+
+        return ip, cert_pem, private_key_pem, ca_pem, public_key_pem
+
+    async def resign_host_certificate(
+        self,
+        node: Node,
+        network: Network,
+        duration_days: Optional[int] = None,
+    ) -> str:
+        """
+        Re-sign a node's certificate with its current groups, keeping its existing IP
+        and public/private keypair unchanged (e.g. after a group edit). Only the .crt
+        file is overwritten - no re-enrollment needed, since the running device picks
+        up the new cert on its next config poll (cert bytes change -> ETag changes ->
+        ncclient rewrites config.yaml and restarts Nebula).
+        Returns the new cert_pem. Raises ValueError if the node has no existing
+        certificate to re-sign (no public key or IP on file).
+        """
+        if not node.public_key or not node.ip_address:
+            raise ValueError("Node has no existing certificate to re-sign")
+
+        await self.ensure_ca(network)
+        duration_days = duration_days or settings.default_cert_expiry_days
+        duration_hours = duration_days * 24
+
+        base = Path(settings.cert_store_path) / str(network.id) / "hosts"
+        base.mkdir(parents=True, exist_ok=True)
+        out_crt = base / f"{node.hostname}.crt"
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".pub", delete=False) as f:
+            f.write(node.public_key)
+            pub_path = Path(f.name)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                ca_crt_tmp = tmp / "ca.crt"
+                ca_key_tmp = tmp / "ca.key"
+                out_crt_tmp = tmp / "host.crt"
+                ca_crt_tmp.write_text(read_cert_store_file(Path(network.ca_cert_path)))
+                ca_key_tmp.write_text(read_cert_store_file(Path(network.ca_key_path)))
+                _roots = [Path(settings.cert_store_path), Path(tempfile.gettempdir())]
+                cert_sign(
+                    ca_crt_tmp,
+                    ca_key_tmp,
+                    name=node.hostname,
+                    ip=node.ip_address,
+                    out_crt=out_crt_tmp,
+                    groups=node.groups or [],
+                    duration_hours=duration_hours,
+                    in_pub=pub_path,
+                    subnet_cidr=network.subnet_cidr,
+                    unsafe_subnets=_unsafe_subnets_for_cert(node, network),
+                    allowed_roots=_roots,
+                )
+                cert_pem = out_crt_tmp.read_text()
+        finally:
+            pub_path.unlink(missing_ok=True)
+
+        # The certificate being replaced carries the OLD groups/subnets and stays valid
+        # until it expires - blocklist it, or e.g. removing the node from a group
+        # wouldn't actually take that group's firewall access away.
+        await block_host_cert_file(self.session, network.id, node.hostname, "superseded", node_id=node.id)
+        write_cert_store_file(out_crt, cert_pem)
+        await unblock_issued_cert(self.session, network.id, cert_pem)
+
+        await self.session.execute(
+            update(Certificate)
+            .where(Certificate.node_id == node.id, Certificate.revoked_at.is_(None))
+            .values(revoked_at=datetime.utcnow())
+        )
+        expires_at = datetime.utcnow() + timedelta(days=duration_days)
+        self.session.add(Certificate(node_id=node.id, expires_at=expires_at))
+        await self.session.flush()
+
+        return cert_pem
+
+    async def create_host_certificate_for_existing_node(
+        self,
+        node: Node,
+        network: Network,
+        suggested_ip: Optional[str] = None,
+        duration_days: Optional[int] = None,
+    ) -> tuple[str, str, str, str, str]:
+        """
+        Create a new host certificate for an existing node (e.g. after revoke or re-enroll).
+        Allocates IP, generates new keypair, signs, writes files, updates node, adds Certificate record.
+        Returns (ip_address, cert_pem, private_key_pem, ca_pem, public_key_pem).
+        """
+        await self.ensure_ca(network)
+        duration_days = duration_days or settings.default_cert_expiry_days
+        duration_hours = duration_days * 24
+
+        ip = await self.ip_allocator.allocate(
+            network.id, network.subnet_cidr, suggested_ip, node_id=node.id
+        )
+
+        base = Path(settings.cert_store_path) / str(network.id) / "hosts"
+        base.mkdir(parents=True, exist_ok=True)
+        name = node.hostname
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pub_path = tmp / "host.pub"
+            key_path = tmp / "host.key"
+            out_crt_tmp = tmp / "host.crt"
+            ca_crt_tmp = tmp / "ca.crt"
+            ca_key_tmp = tmp / "ca.key"
+            ca_crt_tmp.write_text(read_cert_store_file(Path(network.ca_cert_path)))
+            ca_key_tmp.write_text(read_cert_store_file(Path(network.ca_key_path)))
+            _roots = [Path(settings.cert_store_path), Path(tempfile.gettempdir())]
+            keygen(out_pub=pub_path, out_key=key_path, allowed_roots=_roots)
+            cert_sign(
+                ca_crt_tmp,
+                ca_key_tmp,
+                name=name,
+                ip=ip,
+                out_crt=out_crt_tmp,
+                groups=node.groups or [],
+                duration_hours=duration_hours,
+                in_pub=pub_path,
+                subnet_cidr=network.subnet_cidr,
+                unsafe_subnets=_unsafe_subnets_for_cert(node, network),
+                allowed_roots=_roots,
+            )
+            cert_pem = out_crt_tmp.read_text()
+            private_key_pem = key_path.read_text()
+            public_key_pem = pub_path.read_text()
+
+        await block_host_cert_file(self.session, network.id, name, "superseded", node_id=node.id)
+        write_cert_store_file(base / f"{name}.crt", cert_pem)
+        await unblock_issued_cert(self.session, network.id, cert_pem)
+        key_file = base / f"{name}.key"
+        write_cert_store_file(key_file, private_key_pem)
+
+        node.ip_address = ip
+        node.public_key = public_key_pem
+        node.status = "active"
+        await self.session.flush()
+
+        expires_at = datetime.utcnow() + timedelta(days=duration_days)
+        cert_record = Certificate(
+            node_id=node.id,
+            expires_at=expires_at,
+        )
+        self.session.add(cert_record)
+        await self.session.flush()
+
+        ca_pem = ""
+        if network.ca_cert_path:
+            try:
+                ca_pem = read_cert_store_file(Path(network.ca_cert_path))
+            except FileNotFoundError:
+                logger.warning("CA cert file not found: %s", network.ca_cert_path)
+            except PermissionError:
+                logger.error("Permission denied reading CA cert: %s", network.ca_cert_path)
+            except Exception as e:
+                logger.error("Unexpected error reading CA cert from %s: %s", network.ca_cert_path, e)
+
+        return ip, cert_pem, private_key_pem, ca_pem, public_key_pem

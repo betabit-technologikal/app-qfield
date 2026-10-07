@@ -1,0 +1,195 @@
+# =============================================================================
+# Nebula Commander Backend Configuration
+# =============================================================================
+# This file contains all backend-specific settings including database, JWT,
+# OIDC, CORS, and debug mode. All variables use the NEBULA_COMMANDER_ prefix.
+
+# =============================================================================
+# Database Configuration
+# =============================================================================
+
+# SQLite database URL: use four slashes for absolute path (so DB is at /var/lib/..., not CWD/var/lib/...)
+NEBULA_COMMANDER_DATABASE_URL=sqlite+aiosqlite:////var/lib/nebula-commander/db.sqlite
+
+# Certificate storage path (inside container)
+NEBULA_COMMANDER_CERT_STORE_PATH=/var/lib/nebula-commander/certs
+
+# =============================================================================
+# JWT Authentication
+# =============================================================================
+
+# JWT secret key for signing tokens
+# ⚠️  CRITICAL: Generate a secure random key for production!
+# Use: openssl rand -base64 32
+# DO NOT use this example value in production!
+NEBULA_COMMANDER_JWT_SECRET_KEY=CHANGE_ME_GENERATE_RANDOM_32_CHARS_MIN
+
+# Alternative: Use a secret file (more secure)
+# NEBULA_COMMANDER_JWT_SECRET_FILE=/run/secrets/jwt-secret
+
+# JWT algorithm (HS256, HS384, HS512)
+NEBULA_COMMANDER_JWT_ALGORITHM=HS256
+
+# JWT token expiration in minutes (1440 = 24 hours)
+NEBULA_COMMANDER_JWT_EXPIRATION_MINUTES=1440
+
+# =============================================================================
+# Encryption at rest (required)
+# =============================================================================
+# Fernet key for encrypting sensitive DB columns and cert store files.
+# Generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# ⚠️  Required at startup. Existing deployments: run migrate_encrypt first (see README).
+NEBULA_COMMANDER_ENCRYPTION_KEY=your-fernet-key-here
+
+# Alternative: key from file
+# NEBULA_COMMANDER_ENCRYPTION_KEY_FILE=/run/secrets/encryption-key
+
+# =============================================================================
+# Public URL (required for OIDC and redirects)
+# =============================================================================
+# Base URL where users reach the app (browser). All auth redirects and callbacks
+# use this. Supports FQDN or host:port. Backend and frontend may be on different hosts.
+# Examples: https://nebula.example.com  |  http://192.168.1.1:9091
+# If set, OIDC redirect URI is derived as PUBLIC_URL + /api/auth/callback.
+NEBULA_COMMANDER_PUBLIC_URL=https://nebula.example.com
+
+# =============================================================================
+# Standalone Admin Bootstrap (only relevant if you skip OIDC entirely)
+# =============================================================================
+# When no OIDC provider is configured below, /api/auth/dev-token is disabled by
+# default. If you're running standalone with no IdP and need the UI to be able
+# to self-issue an initial admin session, opt in explicitly here.
+# ⚠️  This grants unauthenticated system-admin access to anyone who can reach
+# the backend. Only enable for a genuinely no-IdP deployment.
+# NEBULA_COMMANDER_STANDALONE_ADMIN_BOOTSTRAP=true
+
+# =============================================================================
+# OIDC Configuration (Optional)
+# =============================================================================
+# Uncomment and configure to use OIDC authentication with Keycloak or other providers.
+# All user-facing auth (login redirect, callback, logout) goes through the public URL above.
+
+# OIDC Issuer URL (internal - backend→Keycloak, same Docker network only)
+# Use CONTAINER port (8080). If Keycloak host port is 8082, still use 8080 here.
+NEBULA_COMMANDER_OIDC_ISSUER_URL=http://keycloak:8080/realms/nebula-commander
+
+# OIDC Public Issuer URL (external - for browser: logout, discovery)
+# Keycloak as seen by the user's browser: FQDN or host:port.
+# Examples: https://auth.example.com/realms/nebula-commander  |  http://host:8082/realms/nebula-commander
+NEBULA_COMMANDER_OIDC_PUBLIC_ISSUER_URL=https://auth.example.com/realms/nebula-commander
+
+# OIDC Client ID (configured in Keycloak)
+NEBULA_COMMANDER_OIDC_CLIENT_ID=nebula-commander
+
+# OIDC Client Secret (from Keycloak client credentials)
+# ⚠️  CRITICAL: Replace with your actual Keycloak client secret!
+# DO NOT use this placeholder value!
+NEBULA_COMMANDER_OIDC_CLIENT_SECRET=YOUR_KEYCLOAK_CLIENT_SECRET_HERE
+
+# Alternative: Use a secret file (more secure)
+# NEBULA_COMMANDER_OIDC_CLIENT_SECRET_FILE=/run/secrets/oidc-secret
+
+# Redirect URI: derived from NEBULA_COMMANDER_PUBLIC_URL when unset (PUBLIC_URL + /api/auth/callback).
+# Override only if you need a different callback URL.
+# NEBULA_COMMANDER_OIDC_REDIRECT_URI=
+
+# OIDC Scopes (space-separated)
+NEBULA_COMMANDER_OIDC_SCOPES=openid profile email
+
+# Admin role claim/value (optional). Leave unset to use Keycloak's default
+# client-roles shape (resource_access.<client_id>.roles). For other providers,
+# point this at whatever top-level claim your provider emits (e.g. "roles",
+# "groups", or an Auth0-style namespaced claim).
+# NEBULA_COMMANDER_OIDC_ADMIN_ROLE_CLAIM=roles
+# NEBULA_COMMANDER_OIDC_ADMIN_ROLE_VALUE=system-admin
+
+# =============================================================================
+# CORS Configuration
+# =============================================================================
+
+# Allowed CORS origins (comma-separated). Include your public app URL (FQDN or host:port).
+# ⚠️  SECURITY WARNING: Using '*' with credentials is insecure!
+# Example: https://nebula.example.com  or  http://192.168.1.1:9091
+NEBULA_COMMANDER_CORS_ORIGINS=https://nebula.example.com
+
+# =============================================================================
+# Session Security
+# =============================================================================
+
+# Set session cookie to HTTPS-only (recommended for production)
+# Set to true when using HTTPS, false for local development over HTTP
+NEBULA_COMMANDER_SESSION_HTTPS_ONLY=false
+
+# =============================================================================
+# Redirect Security
+# =============================================================================
+
+# Allowed hosts for OAuth/OIDC redirects (comma-separated)
+# When empty and NEBULA_COMMANDER_PUBLIC_URL is set, derived from PUBLIC_URL (recommended).
+# Override only for multiple frontend hosts: nebula.example.com,192.168.1.1:9091
+NEBULA_COMMANDER_ALLOWED_REDIRECT_HOSTS=
+
+# =============================================================================
+# Email / SMTP Configuration (Optional)
+# =============================================================================
+
+# Enable email sending for invitations
+NEBULA_COMMANDER_SMTP_ENABLED=false
+
+# SMTP server settings
+# Examples:
+#   Gmail: smtp.gmail.com:587
+#   SendGrid: smtp.sendgrid.net:587
+#   Mailgun: smtp.mailgun.org:587
+#   Office 365: smtp.office365.com:587
+NEBULA_COMMANDER_SMTP_HOST=smtp.gmail.com
+NEBULA_COMMANDER_SMTP_PORT=587
+NEBULA_COMMANDER_SMTP_USE_TLS=true
+
+# SMTP credentials
+# For Gmail: Use an App Password (not your regular password)
+# For SendGrid: Username is 'apikey', password is your API key
+NEBULA_COMMANDER_SMTP_USERNAME=your-email@gmail.com
+NEBULA_COMMANDER_SMTP_PASSWORD=your-app-password
+
+# Alternative: Use a secret file (more secure for production)
+# NEBULA_COMMANDER_SMTP_PASSWORD_FILE=/run/secrets/smtp-password
+
+# Email sender information
+NEBULA_COMMANDER_SMTP_FROM_EMAIL=noreply@example.com
+NEBULA_COMMANDER_SMTP_FROM_NAME=Nebula Commander
+
+# =============================================================================
+# Analytics (Optional)
+# =============================================================================
+# When set, the frontend fetches /api/public-config and injects the corresponding
+# scripts into the page. No auth required; config is public.
+
+# Plausible: set domain to enable. Script loads from PLAUSIBLE_SCRIPT_SRC or default.
+# NEBULA_COMMANDER_PLAUSIBLE_DOMAIN=nebulacdr.example.com
+# Custom proxy example:
+# NEBULA_COMMANDER_PLAUSIBLE_SCRIPT_SRC=https://plausible.example.com/js/script.file-downloads.hash.outbound-links.js
+
+# Google Analytics: set measurement ID to enable (e.g. G-XXXXXXXXXX).
+# NEBULA_COMMANDER_GA_MEASUREMENT_ID=
+
+# Custom scripts: JSON array of { "src": "https://...", "defer": true } or { "inline": "..." }.
+# NEBULA_COMMANDER_ANALYTICS_CUSTOM_SCRIPTS=[{"src":"https://example.com/script.js","defer":true}]
+
+# =============================================================================
+# Debug Mode
+# =============================================================================
+
+# Enable debug mode (enables /dev-token endpoint)
+# WARNING: Never enable in production!
+NEBULA_COMMANDER_DEBUG=false
+
+# =============================================================================
+# Update Check
+# =============================================================================
+
+# Check GitHub for a newer release, shown as a notification in the web UI's
+# About screen. Set to false to disable all outbound calls to github.com (e.g.
+# for air-gapped or privacy-conscious deployments).
+NEBULA_COMMANDER_UPDATE_CHECK_ENABLED=true
+

@@ -1,0 +1,54 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Global light/dark defaults to ensure consistent text colors */
+@layer base {
+  html {
+    color-scheme: light dark;
+  }
+  /* Background and text color are set via plain CSS (not @apply) since the
+     --nc-bg-... and --nc-bg-...-contrast vars are written at runtime by
+     theme/applyTheme.ts, not known at build time. Text is computed per-theme
+     to contrast against the chosen page background, same as badges/buttons. */
+  body {
+    background-color: var(--nc-bg-light);
+    color: var(--nc-bg-light-contrast);
+  }
+  .dark body {
+    background-color: var(--nc-bg-dark);
+    color: var(--nc-bg-dark-contrast);
+  }
+
+  /* Links – logo purple */
+  a {
+    @apply text-purple-600 dark:text-purple-400;
+  }
+
+  /* Tables sit inside Card/tile surfaces (background2) */
+  th, td {
+    color: var(--nc-bg2-light-contrast);
+  }
+  .dark th, .dark td {
+    color: var(--nc-bg2-dark-contrast);
+  }
+
+  /* Muted text should remain readable in dark */
+  .text-muted {
+    @apply text-gray-600 dark:text-gray-300;
+  }
+}
+
+/* Ensure clickable sidebar items show pointer cursor */
+@layer utilities {
+  /* Target Flowbite sidebar items that are clickable */
+  [role="menuitem"] {
+    cursor: pointer;
+  }
+  
+  /* More specific targeting for Flowbite sidebar items */
+  button[role="menuitem"],
+  a[role="menuitem"] {
+    cursor: pointer !important;
+  }
+}

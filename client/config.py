@@ -1,0 +1,53 @@
+"""
+Shared config and paths for ncclient (CLI, GUI clients).
+Settings are stored in settings.json. Config dir is standalone (no token path).
+"""
+import json
+import os
+import sys
+
+__all__ = ["config_dir", "settings_path", "load_settings", "save_settings"]
+
+
+def config_dir() -> str:
+    """Base directory for settings and other config (e.g. nebula downloads).
+    NEBULA_COMMANDER_CONFIG_DIR overrides this when set - used by the Windows
+    service (see client/windows/shared_paths.py) to share a machine-wide
+    %ProgramData% location instead of the per-user default below."""
+    override = os.environ.get("NEBULA_COMMANDER_CONFIG_DIR", "").strip()
+    if override:
+        return override
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+        return os.path.join(appdata, "nebula-commander")
+    return os.path.join(os.path.expanduser("~"), ".config", "nebula-commander")
+
+
+def settings_path() -> str:
+    """Path to settings.json (server, output_dir, interval, nebula_path)."""
+    return os.path.join(config_dir(), "settings.json")
+
+
+def load_settings() -> dict:
+    """Load settings from disk. Returns dict with server, output_dir, interval, nebula_path (or empty)."""
+    path = settings_path()
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_settings(settings: dict) -> None:
+    """Write settings to disk atomically (temp file + os.replace), matching
+    client/status_store.py's pattern - needed since client/service_api.py's
+    D-Bus handler thread and the poll loop thread can both read/write this
+    file within the same process, not just across separate CLI invocations."""
+    path = settings_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
+    os.replace(tmp, path)

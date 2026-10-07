@@ -1,0 +1,656 @@
+import axios, {
+  type InternalAxiosRequestConfig,
+  type AxiosResponse,
+  type AxiosError,
+} from "axios";
+
+/** Request config with optional retry flag used by the 401 interceptor */
+type RequestConfigWithRetry = InternalAxiosRequestConfig & { _retry?: boolean };
+
+const API_BASE = "/api";
+const TOKEN_KEY = "token"; // Changed to match AuthContext
+
+let tokenRefreshTimer: number | null = null;
+
+/**
+ * Decode JWT token to extract expiration time.
+ * Returns null if token is invalid or cannot be decoded.
+ */
+function decodeTokenExpiration(token: string): number | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    
+    const payload = JSON.parse(atob(parts[1]));
+    return payload.exp ? payload.exp * 1000 : null; // Convert to milliseconds
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Schedule automatic token refresh before expiration.
+ * Refreshes 5 minutes before the token expires.
+ */
+function scheduleTokenRefresh(token: string): void {
+  // Clear any existing timer
+  if (tokenRefreshTimer !== null) {
+    clearTimeout(tokenRefreshTimer);
+    tokenRefreshTimer = null;
+  }
+
+  const expirationTime = decodeTokenExpiration(token);
+  if (!expirationTime) return;
+
+  const now = Date.now();
+  const timeUntilExpiry = expirationTime - now;
+  
+  // Refresh 5 minutes before expiration, or immediately if already expired
+  const refreshBuffer = 5 * 60 * 1000; // 5 minutes in milliseconds
+  const timeUntilRefresh = Math.max(0, timeUntilExpiry - refreshBuffer);
+
+  if (timeUntilRefresh > 0) {
+    console.log(`Token will be refreshed in ${Math.round(timeUntilRefresh / 1000)} seconds`);
+    tokenRefreshTimer = window.setTimeout(async () => {
+      console.log('Auto-refreshing token...');
+      const refreshed = await tryDevToken();
+      if (refreshed) {
+        console.log('Token auto-refreshed successfully');
+      } else {
+        console.warn('Failed to auto-refresh token');
+      }
+    }, timeUntilRefresh);
+  } else {
+    // Token is already expired or about to expire, refresh immediately
+    console.log('Token expired or expiring soon, refreshing immediately...');
+    tryDevToken().then(refreshed => {
+      if (refreshed) {
+        console.log('Token refreshed successfully');
+      } else {
+        console.warn('Failed to refresh expired token');
+      }
+    });
+  }
+}
+
+/** Try to obtain a dev token when backend is in debug mode (development). */
+async function tryDevToken(): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/auth/dev-token`);
+    if (!res.ok) return false;
+    const data = (await res.json()) as { token: string };
+    if (data.token) {
+      localStorage.setItem(TOKEN_KEY, data.token);
+      // Schedule automatic refresh for the new token
+      scheduleTokenRefresh(data.token);
+      return true;
+    }
+  } catch {
+    // ignore
+  }
+  return false;
+}
+
+/**
+ * Exchange a one-time code (from the /auth/callback or /reauth/complete redirect)
+ * for the real JWT. Called with no token present yet, so this uses a plain fetch
+ * rather than the authed apiClient instance.
+ */
+export async function exchangeAuthCode(code: string): Promise<string> {
+  const res = await fetch(`${API_BASE}/auth/exchange`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }),
+  });
+  if (!res.ok) {
+    throw new Error("Invalid or expired code");
+  }
+  const data = (await res.json()) as { token: string };
+  return data.token;
+}
+
+/**
+ * Initialize automatic token refresh on app startup.
+ * Call this when the app loads to set up auto-refresh for existing tokens.
+ * In OIDC mode, tokens are managed by the auth flow, so we only try dev token
+ * if no token exists (for development/standalone mode).
+ */
+export function initializeTokenRefresh(): void {
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (token) {
+    scheduleTokenRefresh(token);
+  } else {
+    // Try to get a dev token if none exists (only works when OIDC is not configured)
+    tryDevToken();
+  }
+}
+
+// Create axios instance with interceptors
+export const apiClient = axios.create({
+  baseURL: API_BASE,
+});
+
+// Request interceptor to add auth token
+apiClient.interceptors.request.use(
+  (config: InternalAxiosRequestConfig) => {
+    const token = localStorage.getItem(TOKEN_KEY);
+    console.log('Axios interceptor - token exists:', !!token, 'for URL:', config.url);
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+      console.log('Added Authorization header');
+    }
+    return config;
+  },
+  (error: AxiosError) => Promise.reject(error)
+);
+
+// Response interceptor to handle 401 errors
+apiClient.interceptors.response.use(
+  (response: AxiosResponse) => response,
+  async (error: AxiosError) => {
+    const originalRequest = error.config as RequestConfigWithRetry | undefined;
+    if (!originalRequest) return Promise.reject(error);
+
+    // If 401 and no token, try to get dev token (only works in dev mode)
+    if (error.response?.status === 401 && !originalRequest._retry) {
+      originalRequest._retry = true;
+
+      if (!localStorage.getItem(TOKEN_KEY)) {
+        const got = await tryDevToken();
+        if (got) {
+          // Retry the original request with new token
+          const token = localStorage.getItem(TOKEN_KEY);
+          originalRequest.headers.Authorization = `Bearer ${token}`;
+          return apiClient(originalRequest);
+        }
+      }
+    }
+
+    return Promise.reject(error);
+  }
+);
+
+/** Extract the backend's `{ detail }` error message, falling back to the axios error message. */
+function axiosErrorMessage(error: unknown): string {
+  if (axios.isAxiosError(error)) {
+    const detail = (error.response?.data as { detail?: string } | undefined)?.detail;
+    return detail || error.message;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Typed JSON request through the shared apiClient (axios), so every call gets the same
+ * auth-header injection and 401-retry-via-dev-token behavior from the interceptors above.
+ * Signature/behavior matches the previous fetch-based implementation so callers (including
+ * api/dns.ts) don't need to change.
+ */
+export async function apiFetch<T>(
+  path: string,
+  options: RequestInit = {}
+): Promise<T> {
+  try {
+    const res = await apiClient.request<T>({
+      url: path,
+      method: (options.method as string | undefined) || "GET",
+      data: options.body,
+      headers: options.body ? { "Content-Type": "application/json" } : undefined,
+    });
+    return res.data;
+  } catch (error) {
+    throw new Error(axiosErrorMessage(error));
+  }
+}
+
+export interface ApiInfo {
+  name: string;
+  version: string;
+  status: string;
+}
+
+/** Backend name/version/status - GET /api itself (no auth required). Used by
+ * AboutModal to display the running backend version. */
+export async function getApiInfo() {
+  return apiFetch<ApiInfo>("");
+}
+
+export interface VersionCheck {
+  current_version: string;
+  latest_version: string | null;
+  release_url: string | null;
+  update_available: boolean;
+  check_enabled: boolean;
+}
+
+/** Compare the running version against the latest GitHub release (no auth required).
+ * Used to show the update-available badge/notice in the sidebar and About modal. */
+export async function getVersionCheck() {
+  return apiFetch<VersionCheck>("/version-check");
+}
+
+export async function listNetworks() {
+  return apiFetch<import("../types/networks").Network[]>("/networks");
+}
+
+export async function createNetwork(body: import("../types/networks").NetworkCreate) {
+  return apiFetch<import("../types/networks").Network>("/networks", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function getNetwork(id: number) {
+  return apiFetch<import("../types/networks").Network>(`/networks/${id}`);
+}
+
+export async function updateNetwork(
+  id: number,
+  data: import("../types/networks").NetworkUpdateData
+) {
+  return apiFetch<import("../types/networks").Network>(`/networks/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(data),
+  });
+}
+
+export interface ReauthChallengeResponse {
+  challenge: string;
+  reauth_url: string;
+}
+
+export async function createReauthChallenge(): Promise<ReauthChallengeResponse> {
+  return apiFetch<ReauthChallengeResponse>("/auth/reauth/challenge", {
+    method: "POST",
+  });
+}
+
+export async function deleteNetwork(
+  id: number,
+  reauthToken: string,
+  confirmation: string
+): Promise<void> {
+  try {
+    await apiClient.delete(`/networks/${id}`, {
+      data: { reauth_token: reauthToken, confirmation },
+    });
+  } catch (error) {
+    throw new Error(axiosErrorMessage(error));
+  }
+}
+
+export async function deleteUser(
+  userId: number,
+  reauthToken: string,
+  confirmation: string
+): Promise<void> {
+  try {
+    await apiClient.delete(`/users/${userId}`, {
+      data: { reauth_token: reauthToken, confirmation },
+    });
+  } catch (error) {
+    throw new Error(axiosErrorMessage(error));
+  }
+}
+
+export async function listGroupFirewall(networkId: number) {
+  return apiFetch<import("../types/networks").GroupFirewallConfig[]>(
+    `/networks/${networkId}/group-firewall`
+  );
+}
+
+export async function updateGroupFirewall(
+  networkId: number,
+  groupName: string,
+  data: { inbound_rules: import("../types/networks").InboundFirewallRule[] }
+) {
+  const encoded = encodeURIComponent(groupName);
+  return apiFetch<import("../types/networks").GroupFirewallConfig>(
+    `/networks/${networkId}/group-firewall/${encoded}`,
+    { method: "PUT", body: JSON.stringify(data) }
+  );
+}
+
+export async function deleteGroupFirewall(networkId: number, groupName: string): Promise<void> {
+  const encoded = encodeURIComponent(groupName);
+  try {
+    await apiClient.delete(`/networks/${networkId}/group-firewall/${encoded}`);
+  } catch (error) {
+    throw new Error(axiosErrorMessage(error));
+  }
+}
+
+export interface CheckIpAvailableResponse {
+  available: boolean;
+}
+
+export async function checkIpAvailable(
+  networkId: number,
+  ip: string
+): Promise<CheckIpAvailableResponse> {
+  const encoded = encodeURIComponent(ip);
+  return apiFetch<CheckIpAvailableResponse>(
+    `/networks/${networkId}/check-ip?ip=${encoded}`
+  );
+}
+
+export async function listNodes(networkId?: number) {
+  const q = networkId != null ? `?network_id=${networkId}` : "";
+  return apiFetch<import("../types/nodes").Node[]>(`/nodes${q}`);
+}
+
+export async function getNode(id: number) {
+  return apiFetch<import("../types/nodes").Node>(`/nodes/${id}`);
+}
+
+export type NodeUpdateData = {
+  group?: string | null;
+  is_lighthouse?: boolean;
+  is_relay?: boolean;
+  public_endpoint?: string | null;
+  advertise_addrs?: string[];
+  lighthouse_options?: import("../types/nodes").LighthouseOptions | null;
+  logging_options?: import("../types/nodes").LoggingOptions | null;
+  punchy_options?: import("../types/nodes").PunchyOptions | null;
+  platform?: import("../types/nodes").NodePlatform;
+  unsafe_routes?: import("../types/nodes").UnsafeRoute[];
+};
+
+export async function updateNode(id: number, data: NodeUpdateData) {
+  return apiFetch<{ ok: boolean; cert_resigned?: boolean }>(`/nodes/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(data),
+  });
+}
+
+export async function setSubnetRouter(nodeId: number, routerNodeId: number | null) {
+  return apiFetch<{ ok: boolean; router_node_id: number | null }>(`/nodes/${nodeId}/subnet-router`, {
+    method: "PUT",
+    body: JSON.stringify({ router_node_id: routerNodeId }),
+  });
+}
+
+export async function setExitNode(nodeId: number, exitNodeId: number | null) {
+  return apiFetch<{ ok: boolean; exit_node_id: number | null }>(`/nodes/${nodeId}/exit-node`, {
+    method: "PUT",
+    body: JSON.stringify({ exit_node_id: exitNodeId }),
+  });
+}
+
+export async function deleteNode(
+  nodeId: number,
+  reauthToken: string,
+  confirmation: string
+): Promise<void> {
+  try {
+    await apiClient.delete(`/nodes/${nodeId}`, {
+      data: { reauth_token: reauthToken, confirmation },
+    });
+  } catch (error) {
+    throw new Error(axiosErrorMessage(error));
+  }
+}
+
+export interface SavedTheme {
+  id: number;
+  name: string;
+  tokens: import("../theme/tokens").ThemeTokens;
+  created_at: string;
+}
+
+export async function listSavedThemes() {
+  return apiFetch<SavedTheme[]>("/users/me/themes");
+}
+
+export async function createSavedTheme(name: string, tokens: import("../theme/tokens").ThemeTokens) {
+  return apiFetch<SavedTheme>("/users/me/themes", {
+    method: "POST",
+    body: JSON.stringify({ name, tokens }),
+  });
+}
+
+export async function deleteSavedTheme(id: number): Promise<void> {
+  try {
+    await apiClient.delete(`/users/me/themes/${id}`);
+  } catch (error) {
+    throw new Error(axiosErrorMessage(error));
+  }
+}
+
+export async function revokeNodeCertificate(
+  nodeId: number,
+  reauthToken: string,
+  confirmation: string
+): Promise<{ ok: boolean }> {
+  return apiFetch<{ ok: boolean }>(`/nodes/${nodeId}/revoke-certificate`, {
+    method: "POST",
+    body: JSON.stringify({ reauth_token: reauthToken, confirmation }),
+  });
+}
+
+export async function reenrollNode(nodeId: number): Promise<{ ok: boolean; node_id: number }> {
+  return apiFetch<{ ok: boolean; node_id: number }>(`/nodes/${nodeId}/re-enroll`, {
+    method: "POST",
+  });
+}
+
+/** Fetch a binary endpoint with auth; returns blob. Throws on error. */
+async function apiFetchBlob(path: string): Promise<Blob> {
+  try {
+    const res = await apiClient.get<Blob>(path, { responseType: "blob" });
+    return res.data;
+  } catch (error) {
+    // Error responses come back as a Blob too (responseType: "blob"), not JSON - the
+    // {detail} extraction in axiosErrorMessage() only works for parsed JSON bodies, so
+    // errors here fall back to axios's generic status-code message.
+    throw new Error(axiosErrorMessage(error));
+  }
+}
+
+export async function getNodeConfigBlob(nodeId: number, options?: { enableDns?: boolean }): Promise<Blob> {
+  const query = options?.enableDns ? "?enable_dns=true" : "";
+  return apiFetchBlob(`/nodes/${nodeId}/config${query}`);
+}
+
+export async function getNodeCertsBlob(nodeId: number): Promise<Blob> {
+  return apiFetchBlob(`/nodes/${nodeId}/certs`);
+}
+
+/** With responseType "blob" the error body is a Blob too, hiding the backend's {detail}. */
+async function blobErrorMessage(error: unknown): Promise<string> {
+  if (axios.isAxiosError(error) && error.response?.data instanceof Blob) {
+    try {
+      const body = JSON.parse(await error.response.data.text()) as { detail?: unknown };
+      if (body?.detail) return String(body.detail);
+    } catch {
+      // not JSON: fall through to the generic message
+    }
+  }
+  return axiosErrorMessage(error);
+}
+
+// --- Backup & export (system admins; both actions need a fresh reauth token) ---
+
+export interface BackupStatus {
+  can_import: boolean;
+  networks: number;
+  nodes: number;
+  min_passphrase_length: number;
+  public_url: string | null;
+}
+
+export async function getBackupStatus(): Promise<BackupStatus> {
+  return apiFetch<BackupStatus>("/admin/backup/status");
+}
+
+/** Download the whole instance, encrypted with `passphrase`. The passphrase goes only into this request. */
+export async function exportInstance(
+  reauthToken: string,
+  passphrase: string,
+  includeDeviceKey: boolean
+): Promise<{ blob: Blob; filename: string }> {
+  try {
+    const res = await apiClient.post<Blob>(
+      "/admin/export",
+      { reauth_token: reauthToken, passphrase, include_device_key: includeDeviceKey },
+      { responseType: "blob" }
+    );
+    const disposition = String(res.headers["content-disposition"] ?? "");
+    const match = /filename="([^"]+)"/.exec(disposition);
+    return { blob: res.data, filename: match?.[1] ?? "nebula-commander-export.ncexport.age" };
+  } catch (error) {
+    throw new Error(await blobErrorMessage(error));
+  }
+}
+
+export interface ImportSummary {
+  inserted: Record<string, number>;
+  users_created: number;
+  users_matched: number;
+  warnings: string[];
+  cert_files: number;
+  device_key_restored: boolean;
+  same_identity_provider: boolean;
+  source_public_url: string | null;
+  source_app_version: string | null;
+  exported_at: string | null;
+}
+
+export async function importInstance(reauthToken: string, file: File, passphrase: string): Promise<ImportSummary> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("passphrase", passphrase);
+  form.append("reauth_token", reauthToken);
+  try {
+    const res = await apiClient.post<ImportSummary>("/admin/import", form);
+    return res.data;
+  } catch (error) {
+    throw new Error(axiosErrorMessage(error));
+  }
+}
+
+export interface CreateEnrollmentCodeResponse {
+  code: string;
+  expires_at: string;
+  node_id: number;
+  hostname: string;
+}
+
+export async function createEnrollmentCode(
+  nodeId: number,
+  expiresInHours: number = 24
+): Promise<CreateEnrollmentCodeResponse> {
+  return apiFetch<CreateEnrollmentCodeResponse>("/device/enrollment-codes", {
+    method: "POST",
+    body: JSON.stringify({ node_id: nodeId, expires_in_hours: expiresInHours }),
+  });
+}
+
+export interface SignCertificateRequest {
+  network_id: number;
+  name: string;
+  public_key: string;
+  group?: string | null;
+  suggested_ip?: string;
+  duration_days?: number;
+}
+
+export interface SignCertificateResponse {
+  ip_address: string;
+  certificate: string;
+  ca_certificate?: string;
+}
+
+export async function signCertificate(body: SignCertificateRequest) {
+  return apiFetch<SignCertificateResponse>("/certificates/sign", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export interface CreateCertificateRequest {
+  network_id: number;
+  name: string;
+  group?: string | null;
+  suggested_ip?: string;
+  duration_days?: number;
+  is_lighthouse?: boolean;
+  is_relay?: boolean;
+  public_endpoint?: string;
+  lighthouse_options?: {
+    serve_dns?: boolean;
+    dns_host?: string;
+    dns_port?: number;
+    interval_seconds?: number;
+  };
+  punchy_options?: import("../types/nodes").PunchyOptions;
+  platform?: import("../types/nodes").NodePlatform;
+}
+
+export interface CreateCertificateResponse {
+  node_id: number;
+  hostname: string;
+  ip_address: string;
+  certificate: string;
+  private_key: string;
+  ca_certificate?: string;
+}
+
+export async function createCertificate(body: CreateCertificateRequest) {
+  return apiFetch<CreateCertificateResponse>("/certificates/create", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export interface CertificateListItem {
+  id: number;
+  node_id: number;
+  node_name: string;
+  network_id: number;
+  network_name: string;
+  ip_address: string | null;
+  issued_at: string;
+  expires_at: string;
+  revoked_at: string | null;
+}
+
+export async function listCertificates(networkId?: number) {
+  const q = networkId != null ? `?network_id=${networkId}` : "";
+  return apiFetch<CertificateListItem[]>(`/certificates${q}`);
+}
+
+/** Audit log entry (system admin only). */
+export interface AuditEntry {
+  id: number;
+  occurred_at: string;
+  action: string;
+  actor_user_id: number | null;
+  actor_identifier: string | null;
+  actor_email: string | null;
+  resource_type: string | null;
+  resource_id: number | null;
+  result: string;
+  details: string | null;
+  client_ip: string | null;
+}
+
+export interface AuditLogParams {
+  limit?: number;
+  offset?: number;
+  action?: string;
+  resource_type?: string;
+  from_date?: string;
+  to_date?: string;
+}
+
+export async function listAuditLogs(params: AuditLogParams = {}): Promise<AuditEntry[]> {
+  const sp = new URLSearchParams();
+  if (params.limit != null) sp.set("limit", String(params.limit));
+  if (params.offset != null) sp.set("offset", String(params.offset));
+  if (params.action) sp.set("action", params.action);
+  if (params.resource_type) sp.set("resource_type", params.resource_type);
+  if (params.from_date) sp.set("from_date", params.from_date);
+  if (params.to_date) sp.set("to_date", params.to_date);
+  const qs = sp.toString();
+  return apiFetch<AuditEntry[]>(`/audit${qs ? `?${qs}` : ""}`);
+}

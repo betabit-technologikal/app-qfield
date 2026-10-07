@@ -1,0 +1,1545 @@
+#!/usr/bin/env python3
+"""
+ncclient - Nebula Commander device client (dnclient-style).
+
+Enroll once with a code from the Nebula Commander UI, then run as a daemon
+to poll for config and certs and optionally orchestrate the Nebula process
+(dnclientd-style: start/restart Nebula when config changes).
+
+  ncclient enroll --server https://nebula-commander.example.com --code XXXXXXXX
+  ncclient run --server https://nebula-commander.example.com [--output-dir /etc/nebula] [--interval 60]
+  ncclient install   (Linux: install systemd service, prompts for server URL and options)
+  ncclient run --server ... --nebula /usr/bin/nebula
+  ncclient run --server ... --restart-service nebula
+
+Requires: requests
+
+Copyright (C) 2025 NixRTR.  This program is free software: you can redistribute
+it and/or modify it under the terms of the GNU General Public License as
+published by the Free Software Foundation, version 3 or later.  See the
+LICENSE file in this directory for the full text.
+"""
+
+import argparse
+import hashlib
+import os
+import shutil
+import signal
+import subprocess  # nosec B404 - used with shell=False and validated/fixed args
+import sys
+import threading
+import time
+from typing import Callable
+
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+# Env vars that can make a child load the PyInstaller-extracted libs instead of system libs.
+# When we run systemctl (or any system binary), clear these so it uses system libraries only.
+_SYSTEM_LIBRARY_ENV_STRIP = ("LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "LIBPATH")
+
+
+def _env_for_system_binaries() -> dict[str, str]:
+    """Return environment for running system binaries (e.g. systemctl) without PyInstaller lib path.
+    Use this so systemctl loads system OpenSSL instead of the bundled libcrypto (avoids
+    OPENSSL_3.4.0 not found on openSUSE and similar)."""
+    env = os.environ.copy()
+    for key in _SYSTEM_LIBRARY_ENV_STRIP:
+        env.pop(key, None)
+    return env
+
+
+def _which(name: str) -> str:
+    """Resolve a system binary to an absolute path before spawning it, so we
+    don't rely on subprocess's own PATH search (falls back to the bare name
+    if not found, so behavior/error messages are unchanged when it's missing)."""
+    return shutil.which(name) or name
+
+
+# systemd unit template for ncclient install (ExecStart path is substituted)
+_SYSTEMD_UNIT_TEMPLATE = """[Unit]
+Description=Nebula Commander device client (ncclient)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/ncclient
+ExecStart={ncclient_path} run
+ExecStartPre=/bin/sh -c 'if [ -z "$$NEBULA_COMMANDER_SERVER" ]; then echo "Set NEBULA_COMMANDER_SERVER in /etc/default/ncclient"; exit 1; fi'
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+try:
+    import requests
+except ImportError:
+    print("ncclient requires 'requests'. Install with: pip install requests", file=sys.stderr)
+    sys.exit(1)
+
+
+def _server_url(server: str) -> str:
+    base = server.rstrip("/")
+    if not base.startswith("http"):
+        base = "https://" + base
+    return base
+
+
+def _default_output_dir() -> str:
+    """Default directory for config/certs; Windows-friendly.
+    NEBULA_COMMANDER_OUTPUT_DIR overrides it - set by the NixOS module's
+    ncclient wrapper and by _apply_linux_service_defaults() so `routes` finds
+    the available-routes.json the service actually writes."""
+    override = os.environ.get("NEBULA_COMMANDER_OUTPUT_DIR", "").strip()
+    if override:
+        return override
+    if sys.platform == "win32":
+        return os.path.join(os.path.expanduser("~"), ".nebula")
+    return "/etc/nebula"
+
+
+def _detect_os_platform() -> str:
+    """Normalized OS name reported on heartbeat for the node's OS badge in the UI."""
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    return sys.platform
+
+
+def cmd_enroll(server: str, code: str) -> None:
+    from client.service_api import EnrollError, enroll
+
+    try:
+        enroll(server, code)
+    except EnrollError as e:
+        print(e.message, file=sys.stderr)
+        sys.exit(1)
+    print("Enrolled. Token saved.")
+    print("Run: ncclient run")
+
+
+def _config_path(output_dir: str) -> str:
+    return os.path.join(output_dir, "config.yaml")
+
+
+def _dns_client_config_path(output_dir: str) -> str:
+    return os.path.join(output_dir, "dns-client.json")
+
+
+def _available_routes_path(output_dir: str) -> str:
+    return os.path.join(output_dir, "available-routes.json")
+
+
+_EXIT_NODE_CIDRS = ("0.0.0.0/0", "::/0")
+
+
+def _route_kind(route: str) -> str:
+    return "exit" if route in _EXIT_NODE_CIDRS else "subnet"
+
+
+def _via_ip(via) -> "str | None":
+    """Flatten a tun.unsafe_routes entry's `via` to a single IP: it's normally a
+    plain string, but Nebula's ECMP form (multiple gateways advertising the same
+    CIDR) makes it a list of {"gateway": ip}. The client only needs an
+    identifying key for accept/reject matching, not full routing detail - that
+    still comes from the untouched entry itself when a route is kept."""
+    if isinstance(via, str):
+        return via
+    if isinstance(via, list) and via:
+        first = via[0]
+        if isinstance(first, dict):
+            return first.get("gateway")
+    return None
+
+
+def extract_available_routes(config_yaml_bytes: bytes) -> list[dict]:
+    """Parse a server-provided config.yaml's tun.unsafe_routes into a flat,
+    human/UI-friendly list: [{route, via, kind}]. This is everything the
+    server currently authorizes this node to consume (see backend's per-route
+    "consumers" list) - written to available-routes.json unconditionally, so
+    a CLI/GUI can show it regardless of what's been locally accepted."""
+    import yaml
+
+    try:
+        parsed = yaml.safe_load(config_yaml_bytes) or {}
+    except Exception:
+        return []
+    entries = (parsed.get("tun") or {}).get("unsafe_routes") or []
+    result = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        route = str(e.get("route") or "").strip()
+        if not route:
+            continue
+        result.append({"route": route, "via": _via_ip(e.get("via")), "kind": _route_kind(route)})
+    return result
+
+
+def filter_accepted_routes(
+    config_yaml_bytes: bytes,
+    accepted_subnet_routes: list[dict] | None,
+    accepted_exit_node: dict | None,
+) -> bytes:
+    """
+    Rewrite config.yaml's tun.unsafe_routes down to just what's been locally
+    accepted (settings.json's accepted_subnet_routes/accepted_exit_node) -
+    the server-authorized list (see extract_available_routes) is everything
+    this node is *allowed* to consume; this is the separate, local
+    device-consent gate on top of that, deliberately mirroring accept_dns
+    (a device only applies split-horizon DNS if its own owner opted in
+    locally too, even though the network already has DNS configured
+    server-side).
+
+    Returns the input completely unchanged (byte-for-byte) if nothing was
+    actually removed, to avoid any reformatting risk on the PKI block (cert/
+    key text) when there's nothing to filter.
+    """
+    import yaml
+
+    accepted_subnet_keys = {
+        (r.get("route"), r.get("via")) for r in (accepted_subnet_routes or [])
+    }
+    accepted_exit_via = (accepted_exit_node or {}).get("via")
+
+    try:
+        parsed = yaml.safe_load(config_yaml_bytes) or {}
+    except Exception:
+        return config_yaml_bytes
+    tun = parsed.get("tun") or {}
+    entries = tun.get("unsafe_routes") or []
+    if not entries:
+        return config_yaml_bytes
+
+    kept = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        route = str(e.get("route") or "").strip()
+        via_ip = _via_ip(e.get("via"))
+        if _route_kind(route) == "exit":
+            if accepted_exit_via and via_ip == accepted_exit_via:
+                kept.append(e)
+        elif (route, via_ip) in accepted_subnet_keys:
+            kept.append(e)
+
+    if kept == entries:
+        return config_yaml_bytes
+
+    tun["unsafe_routes"] = kept
+    parsed["tun"] = tun
+    return yaml.dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=True).encode("utf-8")
+
+
+# Moved to client/service_api.py (pure, no I/O) so it can be shared between
+# this CLI and the D-Bus server without a circular import; re-exported here
+# since this module's own callers (cmd_routes_accept below) and historical
+# external importers still expect `client.ncclient.validate_new_subnet_route`.
+from client.service_api import validate_new_subnet_route  # noqa: E402
+
+
+def _route_selection_fingerprint(accepted_subnet_routes: list[dict] | None, accepted_exit_node: dict | None):
+    """Hashable snapshot of the current local route selection, used by
+    run_poll_loop to notice a purely local accept/reject change (nothing
+    server-side changed) and force a refetch+reapply."""
+    subnet_key = tuple(sorted((r.get("route"), r.get("via")) for r in (accepted_subnet_routes or [])))
+    exit_key = (accepted_exit_node or {}).get("via")
+    return (subnet_key, exit_key)
+
+
+def _write_available_routes(path: str, routes: list[dict]) -> None:
+    import json
+
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(routes, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _nebula_log_path(output_dir: str) -> str:
+    """Path for Nebula's output log. Default on Windows: %USERPROFILE%\\.nebula\\nebula.log"""
+    return os.path.join(output_dir, "nebula.log")
+
+
+def _close_quietly(f) -> None:
+    """Close the Nebula log handle, if any. Popen only sets proc.stdout/.stderr for PIPE"""
+    if f is None:
+        return
+    try:
+        f.close()
+    except Exception as e:
+        print(f"Error closing Nebula log file: {e}", file=sys.stderr)
+
+
+def _current_process_handle():
+    """Return GetCurrentProcess() as a pointer-sized handle for OpenProcessToken (fixes 64-bit)."""
+    h = ctypes.windll.kernel32.GetCurrentProcess()  # type: ignore[attr-defined]
+    return ctypes.c_void_p(h)
+
+
+def _windows_process_is_elevated() -> bool:
+    """True if the current process has elevated privileges (e.g. running as admin)."""
+    try:
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        advapi32 = ctypes.windll.advapi32  # type: ignore[attr-defined]
+        TOKEN_QUERY = 0x0008
+        TOKEN_READ = 0x20008  # STANDARD_RIGHTS_READ | TOKEN_READ
+        TokenElevation = 20  # TOKEN_ELEVATION.TokenIsElevated
+        TokenElevationType = 18  # TokenElevationTypeDefault=1, Full=2, Limited=3
+        TokenElevationTypeFull = 2
+        handle = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(
+            _current_process_handle(),
+            TOKEN_READ,
+            ctypes.byref(handle),
+        ):
+            return False
+        try:
+            elevation = wintypes.DWORD()
+            size = ctypes.sizeof(elevation)
+            if advapi32.GetTokenInformation(
+                handle,
+                TokenElevation,
+                ctypes.byref(elevation),
+                size,
+                ctypes.byref(wintypes.DWORD(size)),
+            ):
+                if elevation.value:
+                    return True
+            # Fallback: TokenElevation can be 0 in some contexts; check TokenElevationType.
+            typ = wintypes.DWORD()
+            if advapi32.GetTokenInformation(
+                handle,
+                TokenElevationType,
+                ctypes.byref(typ),
+                ctypes.sizeof(typ),
+                ctypes.byref(wintypes.DWORD(ctypes.sizeof(typ))),
+            ):
+                return typ.value == TokenElevationTypeFull
+            return False
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return False
+
+
+def is_process_elevated() -> bool:
+    """True if the current process has elevated privileges. On non-Windows, returns True (no elevation concept)."""
+    if sys.platform != "win32":
+        return True
+    return _windows_process_is_elevated()
+
+
+def _start_nebula(nebula_bin: str, output_dir: str) -> subprocess.Popen | None:
+    output_dir = os.path.expanduser(output_dir)
+    config = _config_path(output_dir)
+    if not os.path.exists(config):
+        return None
+    config_abs = os.path.abspath(config)
+    # Resolve to an absolute path before spawning on every platform (not just Windows),
+    # so we don't rely on Popen's own PATH search at spawn time.
+    nebula_abs = os.path.abspath(nebula_bin) if os.path.dirname(nebula_bin) else _which(nebula_bin)
+
+    if sys.platform == "win32":
+        # Nebula MUST run elevated (TAP device, etc.). Only start via Popen so the child
+        # inherits our token; do not use ShellExecute runas (separate session, no handle).
+        if not _windows_process_is_elevated():
+            print(
+                "Nebula requires Administrator. Run this in an elevated terminal, "
+                "or install the NebulaCommanderService (MSI installer) so it runs "
+                "as LocalSystem instead.",
+                file=sys.stderr,
+            )
+            return None
+        manual_run = (
+            f'To see Nebula errors, run in an elevated terminal: cd /d "{output_dir}" && "{nebula_abs}" -config "{config_abs}"'
+        )
+        os.makedirs(output_dir, exist_ok=True)
+        nebula_to_console = os.environ.get("NCCLIENT_NEBULA_CONSOLE", "").strip().lower() in ("1", "true", "yes")
+        log_file = None
+        try:
+            if nebula_to_console:
+                # Anything logical from Nebula comes from `stdout`. `stderr` handles Go panics.
+                # PIPE + forwarder can miss output on Windows when parent is a GUI app.
+                kwargs = {
+                    "stdout": None,
+                    "stderr": None,
+                    "start_new_session": True,
+                    "cwd": output_dir,
+                }
+                proc = subprocess.Popen(  # nosec B603 - path resolved above, shell=False
+                    [nebula_abs, "-config", config_abs],
+                    **kwargs,
+                )
+                log_note = " (output to console)"
+            else:
+                log_path = _nebula_log_path(output_dir)
+                log_file = open(log_path, "a", encoding="utf-8", errors="replace")
+                kwargs = {
+                    # Fold all logs into `stdout` and then into the log file.
+                    "stdout": log_file,
+                    "stderr": subprocess.STDOUT,
+                    "start_new_session": True,
+                    "cwd": output_dir,
+                    # On Windows, starting a console-mode child from a parent with
+                    # no console of its own (e.g. the Windows Service, session 0)
+                    # would normally pop up a new console window. Suppress that by
+                    # creating the process with no window unless
+                    # NCCLIENT_NEBULA_CONSOLE is set (verbose/console mode).
+                    "creationflags": subprocess.CREATE_NO_WINDOW,
+                }
+                proc = subprocess.Popen(  # nosec B603 - path resolved above, shell=False
+                    [nebula_abs, "-config", config_abs],
+                    **kwargs,
+                )
+                log_note = ". Log: %s" % log_path
+
+                # Popen leaves proc.stdout None for a file handle, so keep a reference for
+                # _stop_nebula to close.
+                proc._nc_log_file = log_file
+            print(f"Started Nebula (elevated, PID {proc.pid}){log_note}", file=sys.stderr)
+            if not nebula_to_console:
+                print(manual_run)
+            return proc
+        except FileNotFoundError:
+            _close_quietly(log_file)
+            print(f"Nebula binary not found: {nebula_bin}", file=sys.stderr)
+            return None
+        except Exception as e:
+            _close_quietly(log_file)
+            print(f"Failed to start Nebula: {e}", file=sys.stderr)
+            return None
+
+    try:
+        kwargs = {
+            "stdout": None,  # Nebula logs will come out of stdout; this is essential for debugging
+            "stderr": None,  # `stderr` will cover Go runtime panics, not logical Nebula errors.
+            "start_new_session": True,
+            "cwd": output_dir,
+        }
+        proc = subprocess.Popen(  # nosec B603 - path resolved above, shell=False
+            [nebula_abs, "-config", config_abs],
+            **kwargs,
+        )
+        print(f"Started Nebula (PID {proc.pid})")
+        return proc
+    except FileNotFoundError:
+        print(f"Nebula binary not found: {nebula_bin}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"Failed to start Nebula: {e}", file=sys.stderr)
+        return None
+
+
+def _stop_nebula(proc: subprocess.Popen | None) -> None:
+    if proc is not None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        except Exception as e:
+            print(f"Error stopping Nebula process: {e}", file=sys.stderr)
+        _close_quietly(getattr(proc, "_nc_log_file", None))
+        print("Stopped Nebula")
+        return
+    if sys.platform == "win32":
+        # We started Nebula elevated (runas) so we have no handle; try to stop by name.
+        try:
+            subprocess.run(  # nosec B603 - fixed command resolved via shutil.which, shell=False
+                [_which("taskkill"), "/IM", "nebula.exe", "/F"],
+                capture_output=True,
+                timeout=10,
+            )
+            print("Stopped Nebula")
+        except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
+            print(f"taskkill failed: {e}", file=sys.stderr)
+
+
+def _restart_systemd_service(service_name: str) -> bool:
+    try:
+        subprocess.run(  # nosec B603 - fixed command resolved via shutil.which, shell=False
+            [_which("systemctl"), "restart", service_name],
+            check=True,
+            capture_output=True,
+            timeout=30,
+            env=_env_for_system_binaries(),
+        )
+        print(f"Restarted systemd service: {service_name}")
+        return True
+    except FileNotFoundError:
+        print("systemctl not found (not Linux systemd?)", file=sys.stderr)
+        return False
+    except subprocess.CalledProcessError as e:
+        print(f"systemctl restart failed: {e.stderr.decode() if e.stderr else e}", file=sys.stderr)
+        return False
+
+
+def _prompt(prompt: str, default: str = "") -> str:
+    """Prompt for input; return default if user presses Enter."""
+    if default:
+        s = input(f"{prompt} [{default}]: ").strip()
+        return s if s else default
+    return input(f"{prompt}: ").strip()
+
+
+def cmd_install(no_start: bool = False, non_interactive: bool = False) -> None:
+    """Install systemd service (Linux only). Checks enrollment, prompts for env, writes unit and env file."""
+    if sys.platform != "linux":
+        print("install is only supported on Linux (systemd).", file=sys.stderr)
+        sys.exit(1)
+    try:
+        if os.geteuid() != 0:
+            print("This command must be run as root (or with sudo).", file=sys.stderr)
+            sys.exit(1)
+    except AttributeError:
+        print("This command must be run as root (or with sudo).", file=sys.stderr)
+        sys.exit(1)
+
+    ncclient_path = shutil.which("ncclient")
+    if not ncclient_path:
+        print(
+            "ncclient not found in PATH. Install with: pip install nebula-commander",
+            file=sys.stderr,
+        )
+        print(
+            "If ncclient is in PATH when not using sudo, run: sudo $(which ncclient) install",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if non_interactive:
+        server = (os.environ.get("NEBULA_COMMANDER_SERVER") or "").strip()
+        if not server:
+            print(
+                "Set NEBULA_COMMANDER_SERVER or run without --non-interactive.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        output_dir = os.environ.get("NEBULA_COMMANDER_OUTPUT_DIR", "/etc/nebula").strip() or "/etc/nebula"
+        interval = os.environ.get("NEBULA_COMMANDER_INTERVAL", "60").strip() or "60"
+        nebula_path = (os.environ.get("NEBULA_COMMANDER_NEBULA") or "").strip()
+        restart_service = (os.environ.get("NEBULA_COMMANDER_RESTART_SERVICE") or "").strip()
+    else:
+        server = _prompt("Nebula Commander server URL (e.g. https://nc.example.com)", "").strip()
+        if not server:
+            print("Server URL is required.", file=sys.stderr)
+            sys.exit(1)
+        server = _server_url(server)
+        output_dir = _prompt("Output directory for config/certs", "/etc/nebula").strip() or "/etc/nebula"
+        interval = _prompt("Poll interval (seconds)", "60").strip() or "60"
+        nebula_path = _prompt("Path to nebula binary (optional, empty to use PATH)", "").strip()
+        restart_service = _prompt(
+            "Systemd service to restart instead of running nebula (optional, empty for none)",
+            "",
+        ).strip()
+
+    from client.token_store import get_token
+    if get_token() is None:
+        print("You have not enrolled yet. Run the following (as root), then run ncclient install again:", file=sys.stderr)
+        print(f"  ncclient enroll --server {server} --code XXXXXXXX", file=sys.stderr)
+        print("Get the code from the Nebula Commander UI: Nodes → Enroll", file=sys.stderr)
+        sys.exit(1)
+
+    env_lines = [
+        f"NEBULA_COMMANDER_SERVER={server}",
+        f"NEBULA_COMMANDER_OUTPUT_DIR={output_dir}",
+        f"NEBULA_COMMANDER_INTERVAL={interval}",
+    ]
+    if nebula_path:
+        env_lines.append(f"NEBULA_COMMANDER_NEBULA={nebula_path}")
+    if restart_service:
+        env_lines.append(f"NEBULA_COMMANDER_RESTART_SERVICE={restart_service}")
+
+    env_content = "\n".join(env_lines) + "\n"
+    unit_path = "/etc/systemd/system/ncclient.service"
+    default_path = "/etc/default/ncclient"
+
+    try:
+        with open(default_path, "w") as f:
+            f.write(env_content)
+        print(f"Wrote {default_path}")
+    except PermissionError:
+        print("Could not write to /etc/default/ncclient. Run with sudo: sudo ncclient install", file=sys.stderr)
+        sys.exit(1)
+
+    unit_content = _SYSTEMD_UNIT_TEMPLATE.format(ncclient_path=ncclient_path)
+    try:
+        with open(unit_path, "w") as f:
+            f.write(unit_content)
+        print(f"Wrote {unit_path}")
+    except PermissionError:
+        print("Could not write to /etc/systemd/system/ncclient.service. Run with sudo: sudo ncclient install", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        _sysenv = _env_for_system_binaries()
+        _systemctl = _which("systemctl")
+        subprocess.run([_systemctl, "daemon-reload"], check=True, capture_output=True, timeout=30, env=_sysenv)  # nosec B603 - fixed command resolved via shutil.which, shell=False
+        subprocess.run([_systemctl, "enable", "ncclient"], check=True, capture_output=True, timeout=30, env=_sysenv)  # nosec B603 - fixed command resolved via shutil.which, shell=False
+        print("Enabled ncclient service.")
+    except subprocess.CalledProcessError as e:
+        print(f"systemctl failed: {e.stderr.decode() if e.stderr else e}", file=sys.stderr)
+        sys.exit(1)
+    except FileNotFoundError:
+        print("systemctl not found.", file=sys.stderr)
+        sys.exit(1)
+
+    if not no_start:
+        if non_interactive:
+            pass
+        else:
+            ans = _prompt("Start ncclient service now?", "Y").strip().upper()
+            if ans in ("", "Y", "YES"):
+                try:
+                    subprocess.run(  # nosec B603 - fixed command resolved via shutil.which, shell=False
+                        [_which("systemctl"), "start", "ncclient"], check=True, capture_output=True, timeout=30, env=_env_for_system_binaries()
+                    )
+                    print("Started ncclient service.")
+                except subprocess.CalledProcessError as e:
+                    print(f"systemctl start failed: {e.stderr.decode() if e.stderr else e}", file=sys.stderr)
+                except FileNotFoundError:
+                    print("systemctl not found.", file=sys.stderr)
+            else:
+                print("Run 'systemctl start ncclient' to start the service.")
+
+    print("Done. Edit /etc/default/ncclient to change settings.")
+
+
+def _update_heartbeat_fields() -> dict:
+    """client_version / auto_update (off|install|notify) / update_available, shown
+    read-only on the server. Never raises."""
+    try:
+        from client import updates
+        from client.version import VERSION
+
+        return {
+            "client_version": VERSION,
+            "auto_update": updates.mode(),
+            "update_available": updates.load_status().get("available_version"),
+        }
+    except Exception:
+        return {}
+
+
+_UPDATE_CHECK_EVERY = 24 * 3600
+_update_check_lock = threading.Lock()
+
+
+def _maybe_check_for_updates(debug_log: Callable[[str], None] | None = None) -> None:
+    """Daily signed-manifest check while automatic updates are on, for NixOS (the
+    only thing it does there: notify) and deb/rpm installs (so status shows what's
+    available between upgrade windows). The Windows service has its own updater
+    thread. Runs in the background; never raises."""
+    try:
+        from client import updates
+
+        kind = updates.install_kind()
+        if kind not in ("nixos", "package") or updates.mode(kind=kind) == "off":
+            return
+        last = updates.load_status().get("last_check")
+        if last:
+            import datetime as _dt
+            age = _dt.datetime.now(_dt.timezone.utc) - _dt.datetime.fromisoformat(last.replace("Z", "+00:00"))
+            if age.total_seconds() < _UPDATE_CHECK_EVERY:
+                return
+    except Exception:
+        return
+    if not _update_check_lock.acquire(blocking=False):
+        return
+
+    def _check() -> None:
+        try:
+            st = updates.check(kind)
+            if st.get("available_version"):
+                print(f"Nebula Commander {st['available_version']} is available "
+                      f"(installed: {updates._version.VERSION}).", file=sys.stderr)
+                for line in st.get("instructions") or []:
+                    print(f"  {line}", file=sys.stderr)
+            elif st.get("last_result") == "error" and debug_log:
+                debug_log(f"update check failed: {st.get('last_error')}")
+        except Exception as e:
+            if debug_log:
+                debug_log(f"update check failed: {e}")
+        finally:
+            _update_check_lock.release()
+
+    threading.Thread(target=_check, name="update-check", daemon=True).start()
+
+
+def _send_heartbeat(
+    base: str,
+    token: str,
+    node_id: int,
+    interval: int,
+    debug_log: Callable[[str], None] | None = None,
+    status_callback: Callable[[str, str], None] | None = None,
+    peer_reachability: dict[int, bool] | None = None,
+    tun_dev: str | None = None,
+) -> None:
+    """Best-effort liveness ping. Failures are reported (via status_callback if provided,
+    else debug_log) rather than silently swallowed - a node that goes dark should leave a
+    trace somewhere the user can actually check, instead of the server simply seeing nothing.
+
+    Reports the configured poll interval so the server can flag a node offline relative to
+    its actual check-in cadence instead of a guessed default. If this node is a lighthouse
+    and has pinged its peers, also reports what it found.
+
+    Always reports os_platform (linux/windows/macos - see _detect_os_platform), used
+    for the node's OS badge in the UI. On Linux, also reports the interfaces available
+    to advertise as a subnet route (tun_dev, this node's own overlay device, is
+    excluded) - see linux_routing.discover_available_subnets. Lets the backend gate
+    and populate the subnet-router/exit-node UI without ncclient needing its own
+    reporting endpoint.
+    """
+    body: dict = {"interval_seconds": interval, "os_platform": _detect_os_platform()}
+    body.update(_update_heartbeat_fields())
+    if peer_reachability:
+        body["peer_reachability"] = peer_reachability
+    if sys.platform.startswith("linux"):
+        try:
+            from client import linux_routing
+            body["available_subnets"] = linux_routing.discover_available_subnets(tun_dev)
+        except Exception as e:
+            if debug_log:
+                debug_log(f"subnet discovery failed: {e}")
+    try:
+        requests.post(
+            f"{base}/api/nodes/{node_id}/heartbeat",
+            headers={"Authorization": f"Bearer {token}"},
+            json=body,
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        msg = f"heartbeat failed: {e}"
+        if status_callback:
+            status_callback("error", msg)
+        elif debug_log:
+            debug_log(msg)
+
+
+def _fetch_lighthouse_peers(
+    base: str,
+    token: str,
+    debug_log: Callable[[str], None] | None = None,
+) -> list[dict]:
+    """Best-effort fetch of peers to ping (empty for non-lighthouse nodes and on any failure)."""
+    try:
+        r = requests.get(
+            f"{base}/api/device/lighthouse-peers",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if r.ok:
+            return r.json().get("peers", [])
+    except requests.RequestException as e:
+        if debug_log:
+            debug_log(f"lighthouse-peers fetch failed: {e}")
+    return []
+
+
+def _fetch_advertised_routes(
+    base: str,
+    token: str,
+    debug_log: Callable[[str], None] | None = None,
+) -> list[str]:
+    """
+    Best-effort fetch of the CIDRs *this* device advertises as a subnet router / exit
+    node (empty for nodes that don't advertise any, and on any failure). Deliberately
+    separate from the fetched nebula.yml - a node's own tun.unsafe_routes never contains
+    entries for routes it advertises itself (see backend's
+    config_generator._collect_advertised_routes), so this is the only way ncclient can
+    learn what host-side forwarding/NAT (linux_routing.apply_routes) it should set up.
+    """
+    try:
+        r = requests.get(
+            f"{base}/api/device/advertised-routes",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if r.ok:
+            return r.json().get("routes", [])
+    except requests.RequestException as e:
+        if debug_log:
+            debug_log(f"advertised-routes fetch failed: {e}")
+    return []
+
+
+def _ping_peers(
+    peers: list[dict],
+    debug_log: Callable[[str], None] | None = None,
+) -> dict[int, bool]:
+    """Ping each peer's Nebula IP via the system ping binary; return {node_id: reachable}."""
+    results: dict[int, bool] = {}
+    for peer in peers:
+        ip = peer.get("ip_address")
+        node_id = peer.get("node_id")
+        if not ip or node_id is None:
+            continue
+        if sys.platform == "win32":
+            cmd = ["ping", "-n", "1", "-w", "1000", ip]
+        else:
+            cmd = ["ping", "-c", "1", "-W", "1", ip]
+        try:
+            result = subprocess.run(  # nosec B603 - fixed argv, ip comes from our own backend
+                cmd, capture_output=True, timeout=5
+            )
+            results[node_id] = result.returncode == 0
+        except (subprocess.SubprocessError, OSError) as e:
+            if debug_log:
+                debug_log(f"ping {ip} failed: {e}")
+            results[node_id] = False
+    return results
+
+
+def run_poll_loop(
+    server: str,
+    output_dir: str,
+    interval: int,
+    nebula_bin: str | None,
+    restart_service: str | None,
+    stop_event: threading.Event,
+    status_callback: Callable[[str, str], None] | None = None,
+    accept_dns: bool = False,
+    dns_debug_log: Callable[[str], None] | None = None,
+) -> None:
+    """
+    Poll for config/certs and optionally run Nebula. Exits when stop_event is set.
+    status_callback(status, message) is called with "idle", "connected", or "error".
+    When accept_dns is True, fetch dns-client-config, write dns-client.json, and apply
+    split-horizon DNS (systemd-resolved / NRPT); remove on exit and on start.
+    When dns_debug_log is provided, it is called with DNS-related debug messages
+    for troubleshooting.
+    """
+    from client.token_store import get_token
+    from client.config import load_settings
+    from client.dns_apply import apply_split_horizon_dns, ensure_split_horizon_dns, remove_split_horizon_dns
+
+    base = _server_url(server)
+
+    def _sleep() -> None:
+        elapsed = 0
+        while elapsed < interval and not stop_event.is_set():
+            stop_event.wait(timeout=1)
+            elapsed += 1
+
+    def _wait_for_enrollment(message: str, rejected: "str | None" = None) -> "str | None":
+        """Block, re-checking token_store every couple seconds, until a
+        token exists or stop_event is set (returns None in that case).
+        rejected: a token the server just refused (401) - wait for a
+        DIFFERENT one, otherwise the still-stored rejected token is returned
+        straight away and the poll loop retries it with no delay forever.
+
+        Only reached when status_callback is set - i.e. running as a
+        long-lived service that also hosts client/linux/dbus_server.py's
+        D-Bus API. Without this, a missing/invalid token used to make this
+        whole function - and the process hosting it - exit, which for a
+        plain foreground `ncclient run` is fine (still preserved below,
+        unchanged), but for the service is exactly backwards: the D-Bus
+        service exists specifically so the desktop app's Enroll button can
+        fix this token problem, and it can't do that if the process (and
+        its D-Bus thread) is dead. Confirmed hitting exactly this
+        deadlock - the service exiting on 401 left only a ~1-2s window
+        every 30s (Restart=on-failure/RestartSec=30) where the D-Bus
+        service was actually reachable, so the desktop app's Enroll call
+        almost always landed while the bus name simply wasn't owned by
+        anyone ("was not provided by any .service files")."""
+        status_callback("idle", message)
+        while not stop_event.is_set():
+            t = get_token()
+            if t and t != rejected:
+                return t
+            stop_event.wait(timeout=2)
+        return None
+
+    token = get_token()
+    if not token:
+        if status_callback:
+            token = _wait_for_enrollment("Not enrolled. Waiting for enrollment...")
+            if token is None:
+                return
+        else:
+            print("Token not found. Run 'ncclient enroll' first.", file=sys.stderr)
+            sys.exit(1)
+    node_id = load_settings().get("node_id")
+    if not node_id and dns_debug_log:
+        dns_debug_log("no node_id in settings (enrolled before heartbeat support); skipping heartbeat until re-enroll")
+    url = f"{base}/api/device/config"
+    dns_url = f"{base}/api/device/dns-client-config"
+    output_dir = os.path.expanduser(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    last_etag: str | None = None
+    nebula_proc: subprocess.Popen | None = None
+    current_tun_dev: str | None = None  # this node's own tun device, parsed from its config (Linux routing only)
+    last_advertised_routes: list[str] | None = None  # this node's own advertised routes, for change detection (Linux routing only)
+    last_route_selection_fingerprint = None  # locally accepted subnet routes/exit node - see _route_selection_fingerprint
+
+    # Clean slate on start: remove any split-horizon from a previous crash - and also when
+    # accept_dns is off, since turning it off (e.g. the desktop app's toggle, which restarts
+    # the service without --accept-dns) must undo what an earlier run applied. Only touches
+    # ncclient's own rules/files, and is a no-op without the privilege to change DNS.
+    if dns_debug_log:
+        dns_debug_log(f"accept_dns={accept_dns}, removing any existing split-horizon on start")
+    remove_split_horizon_dns()
+    # The dns-client-config last applied, so unchanged polls can re-check it's still in effect.
+    applied_dns_config: dict = {}
+
+    def _ensure_dns() -> None:
+        if accept_dns and applied_dns_config:
+            ok = ensure_split_horizon_dns(applied_dns_config)
+            if dns_debug_log:
+                dns_debug_log(f"ensure_split_horizon_dns result={ok}")
+
+    def _start_from_last_config(proc: "subprocess.Popen | None", reason: str) -> "subprocess.Popen | None":
+        """The server couldn't be reached (or answered with a non-auth error): if Nebula
+        isn't running yet - e.g. this is the first poll after a reboot during a server
+        outage - start it from the last config.yaml on disk rather than leaving the node
+        offline until the server comes back. A revoked device never gets here with a
+        config: the 401 path below deletes it. Nebula itself refuses an expired cert."""
+        if not nebula_bin or (proc is not None and proc.poll() is None):
+            return proc
+        if not os.path.exists(_config_path(output_dir)):
+            return proc
+        if dns_debug_log:
+            dns_debug_log(f"{reason}; starting Nebula from the last known config")
+        started = _start_nebula(nebula_bin, output_dir)
+        if started is not None and status_callback:
+            status_callback("error", f"{reason} - running on the last known config")
+        return started
+
+    def _tear_down_revoked() -> None:
+        """The server rejected this device's token (revoked, deleted, or re-enrolled
+        elsewhere): stop Nebula and delete everything that lets it rejoin the mesh -
+        config.yaml holds the certificate AND private key inline - plus the routes/DNS
+        it applied. The network-wide blocklist is what enforces revocation; this is the
+        honest client cooperating so it doesn't keep a dead tunnel and key around."""
+        nonlocal nebula_proc, last_etag, last_advertised_routes
+        _stop_nebula(nebula_proc)
+        nebula_proc = None
+        last_etag = None
+        for path in (_config_path(output_dir), _dns_client_config_path(output_dir), _available_routes_path(output_dir)):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                if dns_debug_log:
+                    dns_debug_log(f"could not remove {path}: {e}")
+        applied_dns_config.clear()
+        remove_split_horizon_dns()
+        if sys.platform.startswith("linux") and last_advertised_routes:
+            try:
+                from client import linux_routing
+                linux_routing.apply_routes([], current_tun_dev or "nebula1", debug_log=dns_debug_log)
+            except Exception as e:
+                if dns_debug_log:
+                    dns_debug_log(f"removing advertised routes failed: {e}")
+        last_advertised_routes = None
+
+    if not status_callback:
+        if nebula_bin:
+            print(f"Orchestrating Nebula: {nebula_bin} (restart on config change)")
+        if restart_service:
+            print(f"Orchestrating service: systemctl restart {restart_service} on config change")
+        print(f"Polling {url} every {interval}s. Output: {output_dir}. Ctrl+C to stop.")
+    elif status_callback:
+        status_callback("idle", "Polling...")
+
+    try:
+        while not stop_event.is_set():
+            try:
+                # Accept/reject of specific subnet routes and exit nodes is a purely
+                # local decision (settings.json) - the server side doesn't know or
+                # care what's been accepted, so a change here never shows up as a
+                # different ETag. Re-read on every iteration and force a full
+                # refetch+reapply (ignore any cached ETag) when the selection has
+                # changed since it was last applied, so this is picked up within one
+                # poll cycle - or immediately after a poll_now pipe nudge - the same
+                # way a server-side config change already is.
+                current_settings = load_settings()
+                accepted_subnet_routes = current_settings.get("accepted_subnet_routes") or []
+                accepted_exit_node = current_settings.get("accepted_exit_node")
+                route_selection_fingerprint = _route_selection_fingerprint(accepted_subnet_routes, accepted_exit_node)
+                if route_selection_fingerprint != last_route_selection_fingerprint:
+                    last_route_selection_fingerprint = route_selection_fingerprint
+                    last_etag = None
+
+                headers = {"Authorization": f"Bearer {token}"}
+                if last_etag is not None:
+                    headers["If-None-Match"] = last_etag
+                r = requests.get(url, headers=headers, timeout=30)
+                if r.status_code == 401:
+                    _tear_down_revoked()
+                    if status_callback:
+                        status_callback("error", "This device was revoked, deleted, or re-enrolled elsewhere.")
+                        new_token = _wait_for_enrollment(
+                            "Revoked, deleted, or re-enrolled elsewhere - Nebula stopped. Enroll again to reconnect.",
+                            rejected=token,
+                        )
+                        if new_token is None:
+                            break
+                        token = new_token
+                        node_id = load_settings().get("node_id")
+                        last_etag = None
+                        continue
+                    print(
+                        "This device was revoked, deleted, or re-enrolled elsewhere: Nebula stopped and its "
+                        "config removed. Re-enroll with a new code.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                if r.ok and node_id:
+                    _maybe_check_for_updates(dns_debug_log)
+                    peer_reachability = None
+                    peers = _fetch_lighthouse_peers(base, token, dns_debug_log)
+                    if peers:
+                        peer_reachability = _ping_peers(peers, dns_debug_log)
+                    _send_heartbeat(
+                        base, token, node_id, interval, dns_debug_log,
+                        status_callback=status_callback,
+                        peer_reachability=peer_reachability,
+                        tun_dev=current_tun_dev,
+                    )
+                    if sys.platform.startswith("linux"):
+                        advertised_routes = _fetch_advertised_routes(base, token, dns_debug_log)
+                        if advertised_routes != (last_advertised_routes or []):
+                            try:
+                                from client import linux_routing
+                                linux_routing.apply_routes(
+                                    [{"route": route} for route in advertised_routes],
+                                    current_tun_dev or "nebula1",
+                                    debug_log=dns_debug_log,
+                                )
+                                last_advertised_routes = advertised_routes
+                            except Exception as e:
+                                if dns_debug_log:
+                                    dns_debug_log(f"applying advertised routes failed: {e}")
+                if r.status_code == 304:
+                    if nebula_bin and (nebula_proc is None or nebula_proc.poll() is not None):
+                        nebula_proc = _start_nebula(nebula_bin, output_dir)
+                    _ensure_dns()
+                    _sleep()
+                    continue
+                if not r.ok:
+                    msg = f"Poll failed: {r.status_code} {r.text[:200]}"
+                    if status_callback:
+                        status_callback("error", msg)
+                    else:
+                        print(msg, file=sys.stderr)
+                    nebula_proc = _start_from_last_config(nebula_proc, f"Server returned {r.status_code}")
+                    _sleep()
+                    continue
+                etag_raw = r.headers.get("ETag")
+                config_id = etag_raw.strip('"') if etag_raw is not None else hashlib.sha256(r.content).hexdigest()
+                if last_etag is not None and config_id == last_etag:
+                    if nebula_bin and (nebula_proc is None or nebula_proc.poll() is not None):
+                        nebula_proc = _start_nebula(nebula_bin, output_dir)
+                    _ensure_dns()
+                    _sleep()
+                    continue
+                last_etag = config_id
+
+                # available-routes.json is everything the server authorizes this node
+                # to consume (see backend's per-route "consumers" list), written
+                # unconditionally - config.yaml only gets the locally-accepted subset
+                # (settings.json's accepted_subnet_routes/accepted_exit_node).
+                try:
+                    _write_available_routes(_available_routes_path(output_dir), extract_available_routes(r.content))
+                except OSError as e:
+                    if dns_debug_log:
+                        dns_debug_log(f"writing available-routes.json failed: {e}")
+
+                config_path = _config_path(output_dir)
+                with open(config_path, "wb") as f:
+                    f.write(filter_accepted_routes(r.content, accepted_subnet_routes, accepted_exit_node))
+                if not status_callback:
+                    print(f"Wrote {config_path}")
+                if status_callback:
+                    status_callback("connected", "Config updated")
+                if sys.platform.startswith("linux"):
+                    # Only tun.dev is read from the node's own config here - its own
+                    # advertised routes never appear in its own tun.unsafe_routes (see
+                    # _fetch_advertised_routes above for why) and are fetched separately.
+                    try:
+                        import yaml
+                        parsed = yaml.safe_load(r.content) or {}
+                        current_tun_dev = (parsed.get("tun") or {}).get("dev") or current_tun_dev
+                    except Exception as e:
+                        if dns_debug_log:
+                            dns_debug_log(f"parsing tun.dev from config failed: {e}")
+                if nebula_bin:
+                    _stop_nebula(nebula_proc)
+                    nebula_proc = _start_nebula(nebula_bin, output_dir)
+                if restart_service:
+                    _restart_systemd_service(restart_service)
+
+                # Fetch split-horizon DNS client config and optionally apply
+                dns_path = _dns_client_config_path(output_dir)
+                try:
+                    if dns_debug_log:
+                        dns_debug_log(f"fetching dns-client-config from {dns_url}")
+                    r_dns = requests.get(
+                        dns_url,
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=30,
+                    )
+                    if dns_debug_log:
+                        dns_debug_log(f"dns-client-config status={r_dns.status_code}")
+                    if r_dns.status_code == 200:
+                        with open(dns_path, "wb") as f:
+                            f.write(r_dns.content)
+                        if dns_debug_log:
+                            dns_debug_log(f"wrote dns-client.json to {dns_path}")
+                        if accept_dns:
+                            if dns_debug_log:
+                                dns_debug_log("applying split-horizon DNS...")
+                            applied_dns_config.clear()
+                            applied_dns_config.update(r_dns.json())
+                            ok = apply_split_horizon_dns(config_dict=applied_dns_config)
+                            if dns_debug_log:
+                                dns_debug_log(f"apply_split_horizon_dns result={ok}")
+                    elif r_dns.status_code == 404:
+                        if dns_debug_log:
+                            dns_debug_log("dns-client-config 404 (DNS not enabled for network)")
+                        if os.path.exists(dns_path):
+                            try:
+                                os.remove(dns_path)
+                            except OSError:
+                                pass
+                        if accept_dns:
+                            applied_dns_config.clear()
+                            remove_split_horizon_dns()
+                    else:
+                        if dns_debug_log:
+                            dns_debug_log(f"dns-client-config unexpected status={r_dns.status_code} body={r_dns.text[:200]!r}")
+                    # Ignore other status codes; leave existing dns-client.json as-is
+                except requests.RequestException as e:
+                    if dns_debug_log:
+                        dns_debug_log(f"dns-client-config request failed: {e}")
+                    # Don't fail the poll loop for DNS fetch errors
+
+            except requests.RequestException as e:
+                err = str(e)
+                if status_callback:
+                    status_callback("error", err)
+                else:
+                    print(f"Request error: {e}", file=sys.stderr)
+                nebula_proc = _start_from_last_config(nebula_proc, "Server unreachable")
+            except Exception as e:
+                # Anything else (a bug anywhere in this loop body, e.g. in route
+                # filtering) must never silently kill this thread. Python's default
+                # unhandled-exception behavior for a background thread just prints
+                # to stderr - which goes nowhere for a Windows Service (no console
+                # attached, Session 0) or once daemonized - leaving the service
+                # "Running" but permanently stuck on its last state instead of
+                # visibly erroring. Report it the same way a request failure is
+                # reported, and keep polling rather than let the thread die.
+                err = f"{type(e).__name__}: {e}"
+                if status_callback:
+                    status_callback("error", err)
+                else:
+                    print(f"Unexpected error: {err}", file=sys.stderr)
+                if dns_debug_log:
+                    import traceback
+                    dns_debug_log(traceback.format_exc())
+            _sleep()
+    finally:
+        _stop_nebula(nebula_proc)
+        if accept_dns:
+            if dns_debug_log:
+                dns_debug_log("removing split-horizon on exit")
+            remove_split_horizon_dns()
+
+
+def cmd_run(
+    server: str,
+    output_dir: str,
+    interval: int,
+    nebula_bin: str | None,
+    restart_service: str | None,
+    accept_dns: bool = False,
+) -> None:
+    stop_event = threading.Event()
+
+    def _log_callback(status: str, message: str) -> None:
+        """Print status/error messages so they land in `docker compose logs` (or
+        wherever else stdout/stderr is captured) instead of vanishing into a no-op.
+        Without this, run_poll_loop's status_callback-guarded branches (token
+        missing, 401/re-enroll needed, heartbeat failures) all fire silently with
+        the process just exiting or continuing with zero trace anywhere.
+
+        Also writes status.json into output_dir on every status change - the
+        Linux desktop app (client/linux/desktop.py, via the D-Bus service
+        started below) and any other reader of client.service_api.get_status()
+        depend on this file existing. client/windows/service.py wires its own
+        status_callback straight to client.windows.shared_paths.save_status()
+        instead of going through cmd_run at all, which is why this was never
+        needed here until Linux got a GUI that reads it too - status.json's
+        format is platform-generic (client/status_store.py), so writing it
+        directly here with output_dir (already the correct shared location,
+        e.g. /var/lib/ncclient for the packaged systemd service) needs no
+        per-platform wrapper."""
+        stream = sys.stderr if status == "error" else sys.stdout
+        print(f"[{status}] {message}", file=stream, flush=True)
+        try:
+            from client.status_store import save_status
+            save_status(os.path.join(output_dir, "status.json"), status, message)
+        except OSError as e:
+            print(f"[warn] Could not write status.json: {e}", file=sys.stderr, flush=True)
+
+    try:
+        signal.signal(signal.SIGTERM, lambda s, f: stop_event.set())
+    except (ValueError, OSError) as e:
+        print(f"Could not register SIGTERM handler: {e}", file=sys.stderr)
+
+    dbus_thread = None
+    if sys.platform.startswith("linux"):
+        try:
+            from client.linux.dbus_server import start as start_dbus_server
+            dbus_thread = start_dbus_server(output_dir, stop_event, lambda m: _log_callback("info", m))
+        except Exception as e:
+            print(f"[warn] D-Bus service could not be started: {e}", file=sys.stderr, flush=True)
+        # deb/rpm: make ncclient-update.timer match settings.json (after a restore, or a
+        # timer someone enabled/disabled by hand).
+        try:
+            from client import updates
+            if updates.install_kind() == "package" and os.geteuid() == 0:
+                from client.linux import auto_update
+                auto_update.reconcile(updates.auto_update_settings(), lambda m: _log_callback("info", m))
+        except Exception as e:
+            print(f"[warn] Auto-update timer check failed: {e}", file=sys.stderr, flush=True)
+
+    try:
+        run_poll_loop(
+            server,
+            output_dir,
+            interval,
+            nebula_bin,
+            restart_service,
+            stop_event=stop_event,
+            status_callback=_log_callback,
+            accept_dns=accept_dns,
+        )
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        stop_event.set()
+    # run_poll_loop already stopped nebula and returned
+    if dbus_thread is not None:
+        dbus_thread.join(timeout=5)
+
+
+def _notify_service_poll_now() -> None:
+    """Best-effort nudge to the Windows service to re-poll immediately instead of
+    waiting up to `interval` seconds - a no-op on Linux (no such pipe exists there;
+    a running `ncclient run` daemon picks up settings.json changes on its own next
+    iteration regardless, per run_poll_loop's route-selection fingerprint check)."""
+    if sys.platform != "win32":
+        return
+    try:
+        from client.windows.pipe_protocol import CMD_POLL_NOW, send_command
+        send_command(CMD_POLL_NOW)
+    except Exception:
+        pass
+
+
+def cmd_routes_list(output_dir: str) -> None:
+    from client.config import load_settings
+    from client.service_api import get_available_routes
+
+    available = get_available_routes(output_dir)
+    settings = load_settings()
+    accepted_subnet_routes = settings.get("accepted_subnet_routes") or []
+    accepted_exit_node = settings.get("accepted_exit_node")
+    accepted_subnet_keys = {(r.get("route"), r.get("via")) for r in accepted_subnet_routes}
+    accepted_exit_via = (accepted_exit_node or {}).get("via")
+
+    if not available:
+        print("No routes are currently offered to this node.")
+        return
+    print(f"{'ACCEPTED':<10} {'KIND':<8} {'ROUTE':<20} VIA")
+    for r in available:
+        route, via, kind = r.get("route"), r.get("via"), r.get("kind")
+        accepted = (
+            via == accepted_exit_via if kind == "exit" else (route, via) in accepted_subnet_keys
+        )
+        print(f"{'yes' if accepted else 'no':<10} {kind:<8} {route:<20} {via}")
+
+
+def cmd_routes_accept(output_dir: str, cidr: str, via: str | None) -> None:
+    from client.service_api import RouteError, accept_route
+
+    try:
+        accepted_cidr, accepted_via = accept_route(output_dir, cidr, via)
+    except RouteError as e:
+        print(e.message, file=sys.stderr)
+        sys.exit(1)
+    _notify_service_poll_now()
+    print(f"Accepted {accepted_cidr} via {accepted_via}.")
+
+
+def cmd_routes_reject(output_dir: str, cidr: str) -> None:
+    from client.service_api import RouteError, reject_route
+
+    try:
+        reject_route(output_dir, cidr)
+    except RouteError as e:
+        print(e.message, file=sys.stderr)
+        sys.exit(1)
+    _notify_service_poll_now()
+    print(f"Rejected {cidr}.")
+
+
+def cmd_routes_accept_exit_node(output_dir: str, via: str) -> None:
+    from client.service_api import RouteError, accept_exit_node
+
+    try:
+        accept_exit_node(output_dir, via)
+    except RouteError as e:
+        print(e.message, file=sys.stderr)
+        sys.exit(1)
+    _notify_service_poll_now()
+    print(f"Accepted exit node via {via}.")
+
+
+def cmd_routes_reject_exit_node(output_dir: str) -> None:
+    from client.service_api import RouteError, reject_exit_node
+
+    try:
+        reject_exit_node(output_dir)
+    except RouteError as e:
+        print(e.message, file=sys.stderr)
+        sys.exit(1)
+    _notify_service_poll_now()
+    print("Rejected the accepted exit node.")
+
+
+def _auto_update_call(action: str, **kwargs) -> dict:
+    """Run an auto-update action against the service that owns the state: through
+    the pipe on Windows (needs an elevated prompt), in-process on Linux (as root,
+    with the service's state dir - see _apply_linux_service_defaults)."""
+    if sys.platform == "win32":
+        from client.windows import pipe_protocol as proto
+
+        cmd = {"status": proto.CMD_GET_UPDATE_STATUS, "set": proto.CMD_SET_AUTO_UPDATE,
+               "check": proto.CMD_UPDATE_CHECK_NOW}[action]
+        reply = proto.send_request(cmd, kwargs or None, timeout_ms=5000)
+        if not reply.get("ok"):
+            if reply.get("code") == proto.ERR_ADMIN_REQUIRED:
+                raise SystemExit("Run this from an elevated (Administrator) prompt.")
+            raise SystemExit(f"Nebula Commander service: {reply.get('error')}")
+        if action == "check":  # runs on the service's updater thread
+            return {"started": True}
+        return reply.get("result") or {}
+
+    from client import service_api
+
+    if action != "status" and os.geteuid() != 0:
+        raise SystemExit("Run this as root (sudo).")
+    try:
+        if action == "status":
+            return service_api.get_update_status()
+        if action == "set":
+            return service_api.set_auto_update(kwargs["enabled"], kwargs.get("window_start"), kwargs.get("window_end"))
+        return service_api.check_updates_now()
+    except service_api.ServiceApiError as e:
+        raise SystemExit(e.message)
+
+
+def _print_update_status(st: dict) -> None:
+    kind = st.get("install_kind")
+    installed = st.get("installed_version") or ""
+    if installed.startswith("0.0.0+git."):
+        installed = f"built from commit {installed[len('0.0.0+git.'):]}"
+    elif st.get("dev_build"):
+        installed += " (development build)"
+    print(f"Installed version: {installed}")
+    if not st.get("supported"):
+        print("Automatic updates: not available for this kind of install")
+        return
+    mode = {"install": "on - installs updates", "notify": "on - notify only (NixOS)", "off": "off"}[st.get("mode", "off")]
+    print(f"Automatic updates: {mode}")
+    if kind != "nixos":
+        print(f"Update window:     {st.get('window_start')}-{st.get('window_end')} (local time)")
+    if st.get("last_check"):
+        result = st.get("last_result")
+        detail = st.get("last_error") if result == "error" else result
+        print(f"Last check:        {st['last_check']} ({detail})")
+    if st.get("latest_version"):
+        print(f"Latest release:    {st['latest_version']}")
+    if st.get("available_version"):
+        print(f"Update available:  {st['available_version']}")
+        for line in st.get("instructions") or []:
+            print(f"    {line}")
+    if st.get("last_install_attempt"):
+        result = st.get("last_install_result")
+        detail = st.get("last_install_error") if result == "error" else result
+        print(f"Last install:      {st['last_install_attempt']} ({detail})")
+
+
+def cmd_auto_update(args) -> None:
+    sub = args.auto_update_cmd
+    if sub == "run-upgrade":  # ncclient-update.service only
+        from client.linux.auto_update import run_upgrade
+
+        status = run_upgrade()
+        sys.exit(1 if status.get("last_install_result") == "error" else 0)
+    if sub == "status":
+        _print_update_status(_auto_update_call("status"))
+    elif sub in ("enable", "disable"):
+        window_start = window_end = None
+        if sub == "enable" and args.window:
+            window_start, sep, window_end = args.window.partition("-")
+            if not sep:
+                raise SystemExit("--window takes START-END, e.g. 02:00-05:00")
+        kwargs = {"enabled": sub == "enable"}
+        if window_start:
+            kwargs.update(window_start=window_start, window_end=window_end)
+        _print_update_status(_auto_update_call("set", **kwargs))
+    elif sub == "check-now":
+        st = _auto_update_call("check")
+        if st.get("started"):
+            print("Checking for updates in the service; see `ncclient auto-update status` shortly.")
+        else:
+            _print_update_status(st)
+            if st.get("install_started"):
+                print("Installing it now (journalctl -u ncclient-update to follow).")
+
+
+_LINUX_SERVICE_STATE_DIR = "/var/lib/ncclient"
+
+
+def _apply_linux_service_defaults(cmd: str) -> None:
+    """`sudo ncclient enroll` / `sudo ncclient routes ...` on a host running
+    the packaged service (deb/rpm: state in /var/lib/ncclient) must act on
+    the SERVICE's token/settings/routes - not root's own per-user keyring/
+    ~/.config, which the service never reads. Only for those commands, only
+    as root, only when the service's state dir exists, and never overriding
+    anything already set (the systemd unit and the NixOS wrapper set these
+    explicitly - NixOS's output dir is a subdirectory, for example)."""
+    if cmd not in ("enroll", "routes", "auto-update") or not sys.platform.startswith("linux"):
+        return
+    if os.geteuid() != 0 or not os.path.isdir(_LINUX_SERVICE_STATE_DIR):
+        return
+    if cmd == "auto-update" and os.path.isfile("/usr/lib/systemd/system/ncclient-update.timer"):
+        # The deb/rpm service package (its unit sets the same thing for the service).
+        os.environ.setdefault("NEBULA_COMMANDER_INSTALL_KIND", "package")
+    os.environ.setdefault("NEBULA_COMMANDER_CONFIG_DIR", _LINUX_SERVICE_STATE_DIR)
+    os.environ.setdefault("NEBULA_DEVICE_TOKEN_FILE", os.path.join(_LINUX_SERVICE_STATE_DIR, "token"))
+    os.environ.setdefault("NEBULA_COMMANDER_OUTPUT_DIR", _LINUX_SERVICE_STATE_DIR)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Nebula Commander device client (dnclient/dnclientd-style). Enroll once, then run to poll config and certs and optionally start/restart Nebula."
+    )
+    ap.add_argument("--server", "-s", default=os.environ.get("NEBULA_COMMANDER_SERVER"), help="Nebula Commander base URL (default: NEBULA_COMMANDER_SERVER env)")
+    from client.version import VERSION
+    ap.add_argument("--version", action="version", version=f"ncclient {VERSION}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_install = sub.add_parser("install", help="Install systemd service (Linux only)")
+    p_install.add_argument("--no-start", action="store_true", help="Do not start the service after enable")
+    p_install.add_argument("--non-interactive", action="store_true", help="Use env vars only, no prompts")
+
+    p_enroll = sub.add_parser("enroll", help="Enroll with a one-time code from the UI")
+    p_enroll.add_argument("--code", "-c", required=True, help="Enrollment code")
+
+    p_run = sub.add_parser("run", help="Run daemon: poll for config and certs, optionally start/restart Nebula (dnclientd-style)")
+    p_run.add_argument("--output-dir", "-o", default=None, help="Directory to write config.yaml, ca.crt, host.crt (default: /etc/nebula on Linux, ~/.nebula on Windows)")
+    p_run.add_argument("--interval", "-i", type=int, default=60, help="Poll interval in seconds (default: 60)")
+    p_run.add_argument("--nebula", "-n", metavar="PATH", help="Path to nebula binary if not in PATH (default: run 'nebula' from PATH)")
+    p_run.add_argument("--restart-service", "-r", metavar="NAME", help="Restart this systemd service after config change instead of running nebula (e.g. nebula)")
+    p_run.add_argument("--accept-dns", action="store_true", help="Apply split-horizon DNS (systemd-resolved / NRPT) when dns-client.json is updated; remove on exit")
+
+    p_routes = sub.add_parser(
+        "routes",
+        help="Manage locally-accepted subnet routers / exit nodes (client-side consent on top of server authorization)",
+    )
+    p_routes.add_argument("--output-dir", "-o", default=None, help="Same directory 'run' was given (default: /etc/nebula on Linux, ~/.nebula on Windows)")
+    routes_sub = p_routes.add_subparsers(dest="routes_cmd", required=True)
+
+    routes_sub.add_parser("list", help="Show routes offered to this node and which are accepted")
+
+    p_routes_accept = routes_sub.add_parser("accept", help="Accept a subnet route")
+    p_routes_accept.add_argument("cidr")
+    p_routes_accept.add_argument("--via", help="Gateway IP (required if the CIDR is offered by multiple gateways)")
+
+    p_routes_reject = routes_sub.add_parser("reject", help="Stop using a previously accepted subnet route")
+    p_routes_reject.add_argument("cidr")
+
+    p_routes_accept_exit = routes_sub.add_parser("accept-exit-node", help="Accept an exit node (routes all traffic)")
+    p_routes_accept_exit.add_argument("--via", required=True, help="The exit node gateway's Nebula IP")
+
+    routes_sub.add_parser("reject-exit-node", help="Stop using the accepted exit node")
+
+    p_au = sub.add_parser(
+        "auto-update",
+        help="Automatic client updates (off by default; changing them needs root / an elevated prompt)",
+    )
+    au_sub = p_au.add_subparsers(dest="auto_update_cmd", required=True)
+    au_sub.add_parser("status", help="Show the installed version, the setting and the last check/install")
+    p_au_enable = au_sub.add_parser("enable", help="Turn automatic updates on (on NixOS: check and notify only)")
+    p_au_enable.add_argument("--window", metavar="START-END", help="Daily local-time window to install in (default 02:00-05:00)")
+    au_sub.add_parser("disable", help="Turn automatic updates off")
+    au_sub.add_parser("check-now", help="Check for an update now (and install it, if automatic updates are on)")
+    au_sub.add_parser("run-upgrade", help=argparse.SUPPRESS)
+
+    args = ap.parse_args()
+    _apply_linux_service_defaults(args.cmd)
+    from client.config import load_settings
+    server = (args.server or "").strip() or (load_settings().get("server") or "").strip() or None
+    if args.cmd == "run" and not server:
+        print("Set --server or NEBULA_COMMANDER_SERVER to your Nebula Commander URL.", file=sys.stderr)
+        sys.exit(1)
+    if args.cmd == "enroll" and not server:
+        print("Set --server to your Nebula Commander URL.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.cmd == "install":
+        cmd_install(
+            no_start=getattr(args, "no_start", False),
+            non_interactive=getattr(args, "non_interactive", False),
+        )
+    elif args.cmd == "enroll":
+        cmd_enroll(server, args.code)
+    elif args.cmd == "run":
+        if getattr(args, "nebula", None) and getattr(args, "restart_service", None):
+            print("Use only one of --nebula or --restart-service.", file=sys.stderr)
+            sys.exit(1)
+        nebula_bin = getattr(args, "nebula", None)
+        restart_service = getattr(args, "restart_service", None)
+        # Default: run nebula from PATH; use --nebula only when it's in a non-standard place.
+        if nebula_bin is None and restart_service is None:
+            nebula_bin = "nebula"
+        cmd_run(
+            server,
+            args.output_dir or _default_output_dir(),
+            args.interval,
+            nebula_bin,
+            restart_service,
+            accept_dns=getattr(args, "accept_dns", False),
+        )
+    elif args.cmd == "routes":
+        output_dir = os.path.expanduser(args.output_dir or _default_output_dir())
+        if args.routes_cmd == "list":
+            cmd_routes_list(output_dir)
+        elif args.routes_cmd == "accept":
+            cmd_routes_accept(output_dir, args.cidr, getattr(args, "via", None))
+        elif args.routes_cmd == "reject":
+            cmd_routes_reject(output_dir, args.cidr)
+        elif args.routes_cmd == "accept-exit-node":
+            cmd_routes_accept_exit_node(output_dir, args.via)
+        elif args.routes_cmd == "reject-exit-node":
+            cmd_routes_reject_exit_node(output_dir)
+    elif args.cmd == "auto-update":
+        cmd_auto_update(args)
+if __name__ == "__main__":
+    main()

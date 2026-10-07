@@ -1,0 +1,468 @@
+"""
+SQLAlchemy models for Nebula Commander
+"""
+from datetime import datetime
+from typing import Optional
+
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    JSON,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from ..database import Base, EncryptedText
+
+
+class Network(Base):
+    """Nebula overlay network."""
+
+    __tablename__ = "networks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    subnet_cidr: Mapped[str] = mapped_column(String(64), nullable=False)
+    ca_cert_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    ca_key_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    cert_version: Mapped[int] = mapped_column(Integer, default=2)  # nebula cert format version for this network's CA
+    cert_curve: Mapped[str] = mapped_column(String(16), default="25519")  # "25519" or "P256"
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    nodes: Mapped[list["Node"]] = relationship(
+        "Node", back_populates="network", cascade="all, delete-orphan"
+    )
+    allocated_ips: Mapped[list["AllocatedIP"]] = relationship(
+        "AllocatedIP", back_populates="network", cascade="all, delete-orphan"
+    )
+    group_firewalls: Mapped[list["NetworkGroupFirewall"]] = relationship(
+        "NetworkGroupFirewall", back_populates="network", cascade="all, delete-orphan"
+    )
+    permissions: Mapped[list["NetworkPermission"]] = relationship(
+        "NetworkPermission", back_populates="network", cascade="all, delete-orphan"
+    )
+    settings: Mapped[Optional["NetworkSettings"]] = relationship(
+        "NetworkSettings", back_populates="network", uselist=False, cascade="all, delete-orphan"
+    )
+    dns_config: Mapped[Optional["NetworkDNSConfig"]] = relationship(
+        "NetworkDNSConfig", back_populates="network", uselist=False, cascade="all, delete-orphan"
+    )
+    dns_aliases: Mapped[list["NetworkDNSAlias"]] = relationship(
+        "NetworkDNSAlias", back_populates="network", cascade="all, delete-orphan"
+    )
+    invitations: Mapped[list["Invitation"]] = relationship(
+        "Invitation", back_populates="network", cascade="all, delete-orphan"
+    )
+
+
+class NetworkGroupFirewall(Base):
+    """Per-group firewall rules for a network. Keyed by (network_id, group_name)."""
+
+    __tablename__ = "network_group_firewall"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    network_id: Mapped[int] = mapped_column(ForeignKey("networks.id"), nullable=False)
+    group_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    outbound_rules: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    inbound_rules: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+
+    network: Mapped["Network"] = relationship("Network", back_populates="group_firewalls")
+
+    __table_args__ = (
+        UniqueConstraint("network_id", "group_name", name="uq_network_group_firewall_network_group"),
+    )
+
+
+class Node(Base):
+    """Nebula node (host) in a network."""
+
+    __tablename__ = "nodes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    network_id: Mapped[int] = mapped_column(ForeignKey("networks.id"), nullable=False)
+    hostname: Mapped[str] = mapped_column(String(255), nullable=False)
+    ip_address: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    public_key: Mapped[Optional[str]] = mapped_column(EncryptedText(), nullable=True)
+    groups: Mapped[Optional[list]] = mapped_column(JSON, default=list)  # ["group1", "group2"]
+    is_lighthouse: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_relay: Mapped[bool] = mapped_column(Boolean, default=False)
+    public_endpoint: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)  # e.g. hostname:4242 for static_host_map
+    advertise_addrs: Mapped[Optional[list]] = mapped_column(JSON, default=list)  # ["ip:port"] - lighthouse.advertise_addrs, extra addresses reported to lighthouses
+    lighthouse_options: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)  # interval_seconds; DNS is via ncclient dnsmasq only
+    logging_options: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)  # level, format, disable_timestamp, timestamp_format
+    punchy_options: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)  # respond, delay, respond_delay
+    status: Mapped[str] = mapped_column(String(32), default="pending")  # pending, active, revoked, offline
+    platform: Mapped[str] = mapped_column(String(16), default="desktop")  # desktop, ios, android
+    device_token_version: Mapped[int] = mapped_column(Integer, default=1)
+    last_seen: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    first_polled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)  # set when device first fetches config/bundle
+    checkin_interval_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # reported by ncclient on heartbeat; null until first report
+    lighthouse_reachable: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)  # last ping result reported by a lighthouse on this network
+    lighthouse_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)  # when a lighthouse last reported on this node
+    unsafe_routes: Mapped[Optional[list]] = mapped_column(JSON, default=list)  # [{route, source, interface}] - subnet-router/exit-node CIDRs; only "route" is sent to Nebula
+    available_subnets: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)  # [{interface, cidr, kind}] reported by ncclient each heartbeat (Linux only)
+    os_platform: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)  # "linux"/"windows"/etc, self-reported on heartbeat - Node.platform only covers desktop/ios/android
+    # Self-reported on heartbeat, shown read-only: auto-update is only ever set on the device.
+    client_version: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    auto_update: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)  # off/install/notify
+    update_available: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)  # newer release the device has verified, if any
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    network: Mapped["Network"] = relationship("Network", back_populates="nodes")
+    certificates: Mapped[list["Certificate"]] = relationship(
+        "Certificate", back_populates="node", cascade="all, delete-orphan"
+    )
+    enrollment_codes: Mapped[list["EnrollmentCode"]] = relationship(
+        "EnrollmentCode", back_populates="node", cascade="all, delete-orphan"
+    )
+    permissions: Mapped[list["NodePermission"]] = relationship(
+        "NodePermission", back_populates="node", cascade="all, delete-orphan"
+    )
+    dns_aliases: Mapped[list["NetworkDNSAlias"]] = relationship(
+        "NetworkDNSAlias", back_populates="node", cascade="all, delete-orphan"
+    )
+
+
+class Certificate(Base):
+    """Issued Nebula host certificate."""
+
+    __tablename__ = "certificates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"), nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    node: Mapped["Node"] = relationship("Node", back_populates="certificates")
+
+
+class User(Base):
+    """OIDC user with permissions."""
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    oidc_sub: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    system_role: Mapped[str] = mapped_column(String(64), default="user")  # system-admin or user; network ownership is per-network
+    # Marks the single reserved "deleted user" placeholder row (see backend/api/users.py::delete_user) -
+    # attribution columns that can't be NULL (Invitation.invited_by_user_id, AccessGrant.granted_by_user_id)
+    # get redirected here instead of the real user on delete, so PRAGMA foreign_keys=ON stays satisfiable.
+    is_placeholder: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # Per-user color theme overrides: {tokenKey: {"light": "#rrggbb", "dark": "#rrggbb"}}.
+    # Sparse - only tokens the user has customized; merged over theme_defaults.DEFAULT_THEME
+    # on read. See backend/theme_defaults.py.
+    theme: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    network_permissions: Mapped[list["NetworkPermission"]] = relationship(
+        "NetworkPermission", back_populates="user", foreign_keys="NetworkPermission.user_id",
+        cascade="all, delete-orphan"
+    )
+    node_permissions: Mapped[list["NodePermission"]] = relationship(
+        "NodePermission", back_populates="user", foreign_keys="NodePermission.user_id",
+        cascade="all, delete-orphan"
+    )
+    granted_access: Mapped[list["AccessGrant"]] = relationship(
+        "AccessGrant", back_populates="admin_user", foreign_keys="AccessGrant.admin_user_id",
+        cascade="all, delete-orphan"
+    )
+
+
+class SavedTheme(Base):
+    """A user's named, saved snapshot of their full theme token set - a personal
+    library of presets they can switch between. See backend/theme_defaults.py.
+    Applying one is just a PUT /me/theme with its `tokens`, so there's no
+    separate "active theme" pointer to keep in sync here."""
+
+    __tablename__ = "saved_themes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    tokens: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_saved_theme_user_name"),
+    )
+
+
+class EnrollmentCode(Base):
+    """One-time enrollment code for a node (dnclient-style)."""
+
+    __tablename__ = "enrollment_codes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"), nullable=False)
+    code: Mapped[str] = mapped_column(EncryptedText(), unique=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    node: Mapped["Node"] = relationship("Node", back_populates="enrollment_codes")
+
+
+class AllocatedIP(Base):
+    """IP address allocation for a network (tracks used IPs)."""
+
+    __tablename__ = "allocated_ips"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    network_id: Mapped[int] = mapped_column(ForeignKey("networks.id"), nullable=False)
+    ip_address: Mapped[str] = mapped_column(String(64), nullable=False)
+    node_id: Mapped[Optional[int]] = mapped_column(ForeignKey("nodes.id"), nullable=True)
+    # Set when the IP was released by revoke/delete/re-enroll: the old certificate still
+    # claims this IP until it expires, so the address isn't handed to a different node
+    # before then (only the same node_id may reclaim it early - see IPAllocator).
+    quarantined_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    network: Mapped["Network"] = relationship("Network", back_populates="allocated_ips")
+
+
+class BlockedCertificate(Base):
+    """A host certificate that must no longer be trusted (revoked, deleted, or superseded
+    by a re-sign/re-enroll), by Nebula fingerprint. Every node in the network gets these in
+    pki.blocklist so peers reject it - Nebula has no other way to un-trust a certificate
+    that hasn't expired. Kept independent of the node row so the entry survives node
+    deletion; pruned once expires_at (the certificate's own notAfter) has passed."""
+
+    __tablename__ = "blocked_certificates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    network_id: Mapped[int] = mapped_column(ForeignKey("networks.id"), nullable=False, index=True)
+    fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    reason: Mapped[str] = mapped_column(String(32), nullable=False)  # revoked, deleted, reenrolled, superseded
+    node_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # informational, no FK
+    hostname: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class NetworkPermission(Base):
+    """User permissions for a network."""
+
+    __tablename__ = "network_permissions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    network_id: Mapped[int] = mapped_column(ForeignKey("networks.id"), nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False)  # owner, member
+    can_manage_nodes: Mapped[bool] = mapped_column(Boolean, default=False)
+    can_invite_users: Mapped[bool] = mapped_column(Boolean, default=False)
+    can_manage_firewall: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    invited_by_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+    user: Mapped["User"] = relationship("User", back_populates="network_permissions", foreign_keys=[user_id])
+    network: Mapped["Network"] = relationship("Network", back_populates="permissions")
+    invited_by: Mapped[Optional["User"]] = relationship("User", foreign_keys=[invited_by_user_id])
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "network_id", name="uq_network_permission_user_network"),
+    )
+
+
+class NodePermission(Base):
+    """User permissions for a specific node."""
+
+    __tablename__ = "node_permissions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"), nullable=False)
+    can_view_details: Mapped[bool] = mapped_column(Boolean, default=True)
+    can_download_config: Mapped[bool] = mapped_column(Boolean, default=True)
+    can_download_cert: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    granted_by_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+    user: Mapped["User"] = relationship("User", back_populates="node_permissions", foreign_keys=[user_id])
+    node: Mapped["Node"] = relationship("Node", back_populates="permissions")
+    granted_by: Mapped[Optional["User"]] = relationship("User", foreign_keys=[granted_by_user_id])
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "node_id", name="uq_node_permission_user_node"),
+    )
+
+
+class AccessGrant(Base):
+    """Temporary system admin access to a resource."""
+
+    __tablename__ = "access_grants"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    admin_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(32), nullable=False)  # network, node
+    resource_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    granted_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    admin_user: Mapped["User"] = relationship("User", back_populates="granted_access", foreign_keys=[admin_user_id])
+    granted_by_user: Mapped["User"] = relationship("User", foreign_keys=[granted_by_user_id])
+
+
+class NetworkSettings(Base):
+    """Per-network configuration settings."""
+
+    __tablename__ = "network_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    network_id: Mapped[int] = mapped_column(ForeignKey("networks.id"), unique=True, nullable=False)
+    auto_approve_nodes: Mapped[bool] = mapped_column(Boolean, default=False)
+    default_node_groups: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+    default_is_lighthouse: Mapped[bool] = mapped_column(Boolean, default=False)
+    default_is_relay: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    network: Mapped["Network"] = relationship("Network", back_populates="settings")
+
+
+class NetworkDNSConfig(Base):
+    """Per-network DNS configuration (domain, upstream servers, and flags)."""
+
+    __tablename__ = "network_dns_configs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    network_id: Mapped[int] = mapped_column(
+        ForeignKey("networks.id"), unique=True, nullable=False
+    )
+    # e.g. "nebula.example.com" or "nebula"
+    domain: Mapped[str] = mapped_column(String(255), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Upstream DNS servers for non-local queries (e.g. ["8.8.8.8", "1.1.1.1"])
+    upstream_servers: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    # Additional resolvers for this network's own zone, beyond the automatic
+    # lighthouse-IP list - e.g. an externally-reachable DNS server that's also
+    # authoritative for the domain, or extra fallback redundancy. Appended
+    # after lighthouse IPs wherever dns_servers is built (see
+    # config_generator.get_dns_client_config).
+    extra_dns_resolvers: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+
+    network: Mapped["Network"] = relationship("Network", back_populates="dns_config")
+
+    __table_args__ = (
+        UniqueConstraint("network_id", name="uq_network_dns_config_network"),
+    )
+
+
+class NetworkDNSAlias(Base):
+    """DNS alias within a network zone: alias -> node hostname/IP."""
+
+    __tablename__ = "network_dns_aliases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    network_id: Mapped[int] = mapped_column(
+        ForeignKey("networks.id"), nullable=False, index=True
+    )
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id"), nullable=False)
+    # alias label without the domain, e.g. "api", "db1"
+    alias: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    network: Mapped["Network"] = relationship("Network", back_populates="dns_aliases")
+    node: Mapped["Node"] = relationship("Node", back_populates="dns_aliases")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "network_id",
+            "alias",
+            name="uq_network_dns_alias_network_alias",
+        ),
+    )
+
+
+class Invitation(Base):
+    """User invitation to join a network."""
+
+    __tablename__ = "invitations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    network_id: Mapped[int] = mapped_column(ForeignKey("networks.id"), nullable=False)
+    invited_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    token: Mapped[str] = mapped_column(EncryptedText(), unique=True, nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False)  # owner, member
+    can_manage_nodes: Mapped[bool] = mapped_column(Boolean, default=False)
+    can_invite_users: Mapped[bool] = mapped_column(Boolean, default=False)
+    can_manage_firewall: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending")  # pending, accepted, expired, revoked
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    accepted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    email_status: Mapped[str] = mapped_column(String(32), default="not_sent")  # not_sent, sending, sent, failed
+    email_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    email_error: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+
+    network: Mapped["Network"] = relationship("Network", back_populates="invitations")
+    invited_by_user: Mapped["User"] = relationship("User", foreign_keys=[invited_by_user_id])
+
+
+class AuditLog(Base):
+    """Structured audit log for sensitive actions. Visible to system admins only."""
+
+    __tablename__ = "audit_log"
+    __table_args__ = (Index("ix_audit_log_occurred_at", "occurred_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    actor_identifier: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    resource_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    resource_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    result: Mapped[str] = mapped_column(String(16), default="success", nullable=False)
+    details: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    client_ip: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    actor_user: Mapped[Optional["User"]] = relationship("User", foreign_keys=[actor_user_id])
+
+
+class LegacyDeviceKey(Base):
+    """Device-token signing secret brought in by an instance import (see
+    backend/services/instance_export.py). Devices enrolled on the source instance
+    carry tokens signed with that instance's JWT secret; keeping it here lets them
+    continue after a move with only a server URL change. Only device tokens are ever
+    checked against these keys, and new tokens are always signed with the current secret."""
+
+    __tablename__ = "legacy_device_keys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Stored as encrypt_to_str() output and decrypted explicitly by the code that reads it.
+    key: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)  # source instance public URL
+    imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AuthExchangeCode(Base):
+    """One-time code exchanged for a JWT after an OAuth/reauth redirect, so the
+    token itself never appears in a URL, browser history, or referrer header."""
+
+    __tablename__ = "auth_exchange_codes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    token: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ReauthChallenge(Base):
+    """Outstanding step-up reauthentication challenge for a user (one active
+    challenge per user_sub, DB-backed so it survives across worker processes)."""
+
+    __tablename__ = "reauth_challenges"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_sub: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    challenge: Mapped[str] = mapped_column(String(128), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    authenticated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

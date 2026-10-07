@@ -1,0 +1,2553 @@
+import { useCallback, useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import {
+  Card,
+  Badge,
+  Button,
+  Modal,
+  Label,
+  TextInput,
+  Checkbox,
+  Select,
+  Alert,
+  Accordion,
+} from "flowbite-react";
+import { HiCheckCircle, HiXCircle, HiClock, HiDownload, HiPencil, HiPlus, HiTrash, HiClipboard, HiChevronDown, HiChevronRight } from "react-icons/hi";
+import type { Node, LighthouseOptions, LoggingOptions, PunchyOptions, NodePlatform, UnsafeRoute, SubnetKind } from "../types/nodes";
+import type { Network } from "../types/networks";
+import {
+  listNodes,
+  listNetworks,
+  getNode,
+  updateNode,
+  setSubnetRouter,
+  setExitNode,
+  getNodeConfigBlob,
+  createEnrollmentCode,
+  listGroupFirewall,
+  createCertificate,
+  checkIpAvailable,
+  reenrollNode,
+} from "../api/client";
+import type { CreateEnrollmentCodeResponse } from "../api/client";
+import { startReauthFlow } from "./ReauthComplete";
+import { getEnrollmentState, getCardStatus } from "../utils/nodeStatus";
+import { downloadBlob } from "../utils/download";
+import { useTheme } from "../contexts/ThemeContext";
+import { useErrorToast } from "../contexts/ToastContext";
+import { contrastTextColor } from "../theme/tokens";
+
+const PUBLIC_ENDPOINT_HELP =
+  "Optional. Where other nodes can reach this one directly (Nebula's UDP port, usually 4242). " +
+  "It's added to every node's static_host_map, so peers can connect without asking a lighthouse first. " +
+  "Lighthouses and relays need one.";
+
+const ADVERTISE_ADDRS_HELP =
+  "Optional. Extra IP:port addresses this node reports to lighthouses, for ones Nebula can't discover " +
+  "itself (port forwards, a second uplink). Add one at a time; IP addresses only, port 0 is Nebula's listen port.";
+
+/** Same limit as the backend's MAX_ADVERTISE_ADDRS (services/config_generator.py). */
+const MAX_ADVERTISE_ADDRS = 8;
+
+const AUTO_UPDATE_LABELS: Record<string, string> = {
+  off: "off",
+  install: "installs updates",
+  notify: "notify only",
+};
+
+/** ncclient reports "0.0.0+git.<commit>" for NixOS builds (no release tag) and "0.0.0+dev" for development builds. */
+const formatClientVersion = (version: string): string => {
+  if (version.startsWith("0.0.0+git.")) return `built from commit ${version.slice("0.0.0+git.".length)}`;
+  return version.startsWith("0.0.0+") ? "development build" : `v${version}`;
+};
+
+/** Soft warning (never blocks) for an IPv4 address ending in .0 or .255: on a /24 LAN that's
+ * the network/broadcast address and won't work, but on a larger LAN (/23, /16, ...) it can be
+ * an ordinary host, and Nebula Commander can't know the underlay's mask. Null if no warning. */
+const advertiseAddrWarning = (addr: string): string | null => {
+  const m = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.(\d{1,3}):\d+$/.exec(addr);
+  if (!m || (m[1] !== "0" && m[1] !== "255")) return null;
+  return `Usually a ${m[1] === "0" ? "network" : "broadcast"} address - make sure it's a real host on that LAN`;
+};
+
+const ipv4ToNumber = (ip: string): number => ip.split(".").reduce((acc, octet) => acc * 256 + Number(octet), 0);
+
+/** True if an IPv4 address (as a number) falls inside an IPv4 CIDR like "10.123.0.0/24". */
+const ipv4InCidr = (ip: number, cidr: string): boolean => {
+  const [base, bits] = cidr.split("/");
+  if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(base ?? "") || !/^\d{1,2}$/.test(bits ?? "")) return false;
+  const size = 2 ** (32 - Number(bits));
+  const start = Math.floor(ipv4ToNumber(base) / size) * size;
+  return ip >= start && ip < start + size;
+};
+
+/** Validates one reachable address before it's added to the list: IPv4:port or [IPv6]:port,
+ * and the same address rules the backend's normalize_advertise_addrs applies (not routable,
+ * reserved, IPv4-mapped, inside this node's Nebula network) so they're caught at Add rather
+ * than on Save. The backend stays the real validator - rarer IPv6 reserved ranges are left
+ * to it, and its error still shows on Save. Returns an error message or null. */
+const checkAdvertiseAddr = (value: string, networkCidr?: string): string | null => {
+  const shapeError = "Enter IP:port, e.g. 203.0.113.7:4242 or [2001:db8::1]:4242";
+  const m = /^(?:(\d{1,3}(?:\.\d{1,3}){3})|\[([0-9a-fA-F:.]+)\]):(\d{1,5})$/.exec(value);
+  if (!m || Number(m[3]) > 65535) return shapeError;
+
+  if (m[1]) {
+    const ip = m[1];
+    if (ip.split(".").some((o) => Number(o) > 255)) return shapeError;
+    const n = ipv4ToNumber(ip);
+    const notRoutable =
+      n === 0 || // 0.0.0.0
+      ipv4InCidr(n, "127.0.0.0/8") || // loopback
+      ipv4InCidr(n, "169.254.0.0/16") || // link-local
+      ipv4InCidr(n, "224.0.0.0/4"); // multicast
+    if (notRoutable) return `${ip} is not routable`;
+    if (ipv4InCidr(n, "240.0.0.0/4")) return `${ip} is reserved/not routable`; // incl. 255.255.255.255
+    if (networkCidr && ipv4InCidr(n, networkCidr)) return `${ip} is inside the Nebula network ${networkCidr}`;
+    return null;
+  }
+
+  // IPv6: let the URL parser validate and canonicalize it (lowercase, compressed).
+  let ip: string;
+  try {
+    ip = new URL(`http://[${m[2]}]`).hostname.slice(1, -1);
+  } catch {
+    return shapeError;
+  }
+  if (ip.startsWith("::ffff:")) return "Use the plain IPv4 address, not the IPv4-mapped form";
+  if (ip === "::" || ip === "::1" || /^fe[89ab]/.test(ip) || ip.startsWith("ff")) return `${ip} is not routable`;
+  return null;
+};
+
+export function Nodes() {
+  const { resolve } = useTheme();
+  const [searchParams] = useSearchParams();
+  const [nodes, setNodes] = useState<Node[]>([]);
+  const [networks, setNetworks] = useState<Network[]>([]);
+  const [filterNetworkId, setFilterNetworkId] = useState<number | "">(() => {
+    const n = searchParams.get("network");
+    return n ? Number(n) : "";
+  });
+  const [loading, setLoading] = useState(true);
+  const setError = useErrorToast();
+  const [deviceDetailsModal, setDeviceDetailsModal] = useState<{
+    node: Node | null;
+    isEditing: boolean;
+    showSaved: boolean;
+    savedFading: boolean;
+    certResigned: boolean;
+  }>({ node: null, isEditing: false, showSaved: false, savedFading: false, certResigned: false });
+  const [deviceDetailsForm, setDeviceDetailsForm] = useState<{
+    group: string;
+    is_lighthouse: boolean;
+    is_relay: boolean;
+    public_endpoint: string;
+    advertise_addrs: string[];
+    interval_seconds: string;
+    log_level: string;
+    log_format: string;
+    log_disable_timestamp: boolean;
+    log_timestamp_format: string;
+    punchy_respond: boolean;
+    punchy_delay: string;
+    punchy_respond_delay: string;
+    platform: NodePlatform;
+    unsafe_routes: UnsafeRoute[];
+    subnet_router_id: number | null;
+    exit_node_id: number | null;
+  }>({
+    group: "",
+    is_lighthouse: false,
+    is_relay: false,
+    public_endpoint: "",
+    advertise_addrs: [],
+    interval_seconds: "60",
+    log_level: "info",
+    log_format: "text",
+    log_disable_timestamp: false,
+    log_timestamp_format: "",
+    punchy_respond: true,
+    punchy_delay: "",
+    punchy_respond_delay: "",
+    platform: "desktop",
+    unsafe_routes: [],
+    subnet_router_id: null,
+    exit_node_id: null,
+  });
+  const [otherRouteInput, setOtherRouteInput] = useState("");
+  const [otherRouteError, setOtherRouteError] = useState<string | null>(null);
+  const [advertiseAddrInput, setAdvertiseAddrInput] = useState("");
+  const [advertiseAddrError, setAdvertiseAddrError] = useState<string | null>(null);
+  const [expandedConsumerPickers, setExpandedConsumerPickers] = useState<Set<string>>(new Set());
+  /** Per "Used by" picker (keyed like expandedConsumerPickers): the group / host currently
+   * chosen in its dropdowns but not yet added. */
+  const [consumerPickerSelections, setConsumerPickerSelections] = useState<
+    Record<string, { group: string; host: string }>
+  >({});
+  const [saving, setSaving] = useState(false);
+  const [reEnrollModal, setReEnrollModal] = useState<{
+    open: boolean;
+    node: Node | null;
+    processing: boolean;
+  }>({ open: false, node: null, processing: false });
+  const [revokeModal, setRevokeModal] = useState<{
+    open: boolean;
+    node: Node | null;
+    step: 1 | 2;
+    typedHostname: string;
+    processing: boolean;
+  }>({ open: false, node: null, step: 1, typedHostname: "", processing: false });
+  const setDownloadError = useErrorToast();
+  const [enrollmentCodeModal, setEnrollmentCodeModal] = useState<{
+    open: boolean;
+    data: CreateEnrollmentCodeResponse | null;
+    nodeId: number | null;
+    loading: boolean;
+    enrollmentSuccess: boolean;
+  }>({ open: false, data: null, nodeId: null, loading: false, enrollmentSuccess: false });
+
+  const [showCreateNodeForm, setShowCreateNodeForm] = useState(false);
+  const [createNodeForm, setCreateNodeForm] = useState({
+    network_id: 0,
+    name: "",
+    group: "",
+    suggested_ip: "",
+    duration_days: "365",
+    is_lighthouse: false,
+    is_relay: false,
+    public_endpoint: "",
+    interval_seconds: "60",
+    platform: "desktop" as NodePlatform,
+    android_dns_opt_in: false,
+  });
+  const [mobileConfigPanel, setMobileConfigPanel] = useState<{
+    open: boolean;
+    nodeId: number | null;
+    hostname: string;
+    platform: NodePlatform;
+    enableDns: boolean;
+    reissued: boolean;
+  }>({ open: false, nodeId: null, hostname: "", platform: "desktop", enableDns: false, reissued: false });
+  const [nodeNameError, setNodeNameError] = useState<string | null>(null);
+  const [suggestedIpError, setSuggestedIpError] = useState<string | null>(null);
+  const [createSubmitting, setCreateSubmitting] = useState(false);
+  const [createGroupOptions, setCreateGroupOptions] = useState<string[]>([]);
+  const [editGroupOptions, setEditGroupOptions] = useState<string[]>([]);
+
+  const [deleteModal, setDeleteModal] = useState<{
+    open: boolean;
+    node: Node | null;
+    step: 1 | 2;
+    typedHostname: string;
+  }>({ open: false, node: null, step: 1, typedHostname: "" });
+  const [deleting, setDeleting] = useState(false);
+
+  const loadNetworks = useCallback(() => {
+    listNetworks()
+      .then((data) => {
+        setNetworks(data);
+        setCreateNodeForm((f) =>
+          f.network_id === 0 && data.length > 0 ? { ...f, network_id: data[0].id } : f
+        );
+      })
+      .catch(() => setNetworks([]));
+  }, []);
+
+  const loadNodes = useCallback(() => {
+    setLoading(true);
+    const nid = filterNetworkId === "" ? undefined : filterNetworkId;
+    listNodes(nid)
+      .then(setNodes)
+      .catch((e) => setError(e.message))
+      .finally(() => setLoading(false));
+  }, [filterNetworkId, setError]);
+
+  useEffect(() => {
+    loadNetworks();
+  }, [loadNetworks]);
+
+  useEffect(() => {
+    const id = setTimeout(loadNodes, 0);
+    return () => clearTimeout(id);
+  }, [loadNodes]);
+
+  useEffect(() => {
+    const nid = createNodeForm.network_id;
+    if (!nid) {
+      queueMicrotask(() => setCreateGroupOptions([]));
+      return;
+    }
+    let cancelled = false;
+    listGroupFirewall(nid)
+      .then((list) => {
+        if (cancelled) return;
+        const names = list.map((g) => g.group_name);
+        setCreateGroupOptions(names);
+        setCreateNodeForm((prev) =>
+          prev.network_id === nid && prev.group && !names.includes(prev.group) ? { ...prev, group: "" } : prev
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setCreateGroupOptions([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [createNodeForm.network_id]);
+
+  useEffect(() => {
+    const networkId = deviceDetailsModal.node?.network_id;
+    if (!networkId) {
+      queueMicrotask(() => setEditGroupOptions([]));
+      return;
+    }
+    let cancelled = false;
+    listGroupFirewall(networkId)
+      .then((list) => {
+        if (!cancelled) setEditGroupOptions(list.map((g) => g.group_name));
+      })
+      .catch(() => {
+        if (!cancelled) setEditGroupOptions([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [deviceDetailsModal.node?.network_id]);
+
+  const handleCreateNodeNameBlur = useCallback(() => {
+    const name = createNodeForm.name.trim();
+    const nid = createNodeForm.network_id;
+    if (!nid || !name) {
+      setNodeNameError(null);
+      return;
+    }
+    listNodes(nid)
+      .then((list) => {
+        const exists = list.some((n) => n.hostname === name);
+        setNodeNameError(exists ? "A node with this name already exists in this network." : null);
+      })
+      .catch(() => setNodeNameError(null));
+  }, [createNodeForm.name, createNodeForm.network_id]);
+
+  const handleSuggestedIpBlur = useCallback(() => {
+    const ip = createNodeForm.suggested_ip.trim();
+    const nid = createNodeForm.network_id;
+    if (!nid || !ip) {
+      setSuggestedIpError(null);
+      return;
+    }
+    checkIpAvailable(nid, ip)
+      .then((res) => setSuggestedIpError(res.available ? null : "This IP is already reserved in this network."))
+      .catch(() => setSuggestedIpError(null));
+  }, [createNodeForm.suggested_ip, createNodeForm.network_id]);
+
+  const handleCreateNodeSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    if (nodeNameError || suggestedIpError) return;
+    const platform = createNodeForm.platform;
+    const firstInNetwork = isFirstNodeInNetwork(createNodeForm.network_id);
+    if (platform !== "desktop" && firstInNetwork) {
+      setError("The first node in a network must be a lighthouse; create a desktop lighthouse node first.");
+      return;
+    }
+    setCreateSubmitting(true);
+    const isMobile = platform !== "desktop";
+    const body = {
+      network_id: createNodeForm.network_id,
+      name: createNodeForm.name.trim(),
+      group: createNodeForm.group.trim() || undefined,
+      suggested_ip: createNodeForm.suggested_ip.trim() || undefined,
+      duration_days: createNodeForm.duration_days ? parseInt(createNodeForm.duration_days, 10) : undefined,
+      is_lighthouse: isMobile ? false : firstInNetwork ? true : createNodeForm.is_lighthouse,
+      is_relay: isMobile ? false : createNodeForm.is_relay,
+      public_endpoint: createNodeForm.public_endpoint.trim() || undefined,
+      lighthouse_options: !isMobile && createNodeForm.is_lighthouse
+        ? { interval_seconds: parseInt(createNodeForm.interval_seconds, 10) || 60 }
+        : undefined,
+      platform,
+    };
+    createCertificate(body)
+      .then((res) => {
+        // Reset every per-node field, not just the name: leaving is_lighthouse (auto-ticked
+        // for a network's first node) set made the NEXT node silently a lighthouse too.
+        // Network, platform and validity stay as a convenience for creating several nodes.
+        setCreateNodeForm((f) => ({
+          ...f,
+          name: "",
+          group: "",
+          suggested_ip: "",
+          is_lighthouse: false,
+          is_relay: false,
+          public_endpoint: "",
+          interval_seconds: "60",
+          android_dns_opt_in: false,
+        }));
+        setNodeNameError(null);
+        setSuggestedIpError(null);
+        loadNodes();
+        setShowCreateNodeForm(false);
+        if (isMobile) {
+          setMobileConfigPanel({
+            open: true,
+            nodeId: res.node_id,
+            hostname: res.hostname,
+            platform,
+            enableDns: createNodeForm.android_dns_opt_in,
+            reissued: false,
+          });
+          return;
+        }
+        return createEnrollmentCode(res.node_id, 24).then((enrollData) => {
+          setEnrollmentCodeModal({
+            open: true,
+            data: enrollData,
+            nodeId: enrollData.node_id,
+            loading: false,
+            enrollmentSuccess: false,
+          });
+        });
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setCreateSubmitting(false));
+  };
+
+  const openDeleteModal = (node: Node) => {
+    setDeleteModal({ open: true, node, step: 1, typedHostname: "" });
+  };
+
+  const closeDeleteModal = () => {
+    setDeleteModal({ open: false, node: null, step: 1, typedHostname: "" });
+  };
+
+  const handleDeleteConfirm = async () => {
+    const node = deleteModal.node;
+    if (!node) return;
+    setDeleting(true);
+    try {
+      await startReauthFlow({ kind: "node-delete", nodeId: node.id, hostname: node.hostname });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to start reauthentication");
+      setDeleting(false);
+    }
+  };
+
+  const getNetworkName = (networkId: number): string => {
+    const network = networks.find((n) => n.id === networkId);
+    return network?.name ?? `Network ${networkId}`;
+  };
+
+  const isFirstNodeInNetwork = (networkId: number): boolean =>
+    nodes.filter((n) => n.network_id === networkId).length === 0;
+
+  useEffect(() => {
+    // When creating a node and this is the first node in the selected network,
+    // default Lighthouse to checked so the public endpoint field is visible.
+    // Mobile platforms can't be a lighthouse at all - see the blocking
+    // validation in handleCreateNodeSubmit for that case instead.
+    if (
+      showCreateNodeForm &&
+      createNodeForm.platform === "desktop" &&
+      isFirstNodeInNetwork(createNodeForm.network_id) &&
+      !createNodeForm.is_lighthouse
+    ) {
+      setCreateNodeForm((f) => ({ ...f, is_lighthouse: true }));
+    }
+  }, [showCreateNodeForm, createNodeForm.network_id, createNodeForm.platform]);
+
+  const isOnlyLighthouseInNetwork = (node: Node): boolean =>
+    !!node?.is_lighthouse &&
+    nodes.filter((n) => n.network_id === node.network_id && n.is_lighthouse).length === 1;
+
+  /** Consumer-side mirror of the gateway's "Used by" picker: which single other node
+   * (if any) already lists `node` as a consumer of its advertised subnets (interface/
+   * manual routes) or its exit routes. Undefined/null-safe against legacy rows missing
+   * "consumers" - see _normalize_unsafe_routes on the backend. */
+  const findRouteGatewayId = (node: Node, sources: Array<UnsafeRoute["source"]>): number | null => {
+    const gateway = nodes.find(
+      (n) =>
+        n.network_id === node.network_id &&
+        n.id !== node.id &&
+        (n.unsafe_routes ?? []).some(
+          (r) => sources.includes(r.source) && (r.consumers ?? []).includes(node.id)
+        )
+    );
+    return gateway?.id ?? null;
+  };
+  const findSubnetRouterId = (node: Node): number | null => findRouteGatewayId(node, ["interface", "manual"]);
+  const findExitNodeId = (node: Node): number | null => findRouteGatewayId(node, ["exit_v4", "exit_v6"]);
+
+  const openDeviceDetails = (node: Node) => {
+    setDeviceDetailsModal({ node, isEditing: false, showSaved: false, savedFading: false, certResigned: false });
+    const opts = node.lighthouse_options;
+    const logOpts = node.logging_options;
+    setDeviceDetailsForm({
+      is_lighthouse: node.is_lighthouse,
+      is_relay: node.is_relay,
+      public_endpoint: node.public_endpoint ?? "",
+      advertise_addrs: node.advertise_addrs ?? [],
+      group: (node.groups && node.groups[0]) ?? "",
+      interval_seconds: String(opts?.interval_seconds ?? 60),
+      log_level: logOpts?.level ?? "info",
+      log_format: logOpts?.format ?? "text",
+      log_disable_timestamp: logOpts?.disable_timestamp ?? false,
+      log_timestamp_format: logOpts?.timestamp_format ?? "",
+      punchy_respond: node.punchy_options?.respond ?? true,
+      punchy_delay: node.punchy_options?.delay ?? "",
+      punchy_respond_delay: node.punchy_options?.respond_delay ?? "",
+      platform: node.platform,
+      unsafe_routes: node.unsafe_routes ?? [],
+      subnet_router_id: findSubnetRouterId(node),
+      exit_node_id: findExitNodeId(node),
+    });
+    setOtherRouteInput("");
+    setOtherRouteError(null);
+    setAdvertiseAddrInput("");
+    setAdvertiseAddrError(null);
+    setExpandedConsumerPickers(new Set());
+    setConsumerPickerSelections({});
+    setDownloadError(null);
+  };
+
+  const closeDeviceDetailsModal = () => {
+    setDeviceDetailsModal({ node: null, isEditing: false, showSaved: false, savedFading: false, certResigned: false });
+  };
+
+  const toggleConsumerPickerExpanded = (key: string) => {
+    setExpandedConsumerPickers((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  /** Candidate gateway nodes for the "Use Subnet Router" / "Use Exit Node" dropdowns
+   * on the currently open device-details modal: other nodes on the same network that
+   * advertise at least one matching route. */
+  const routeGatewayCandidates = (sources: Array<UnsafeRoute["source"]>): Node[] => {
+    const current = deviceDetailsModal.node;
+    if (!current) return [];
+    return nodes
+      .filter(
+        (n) =>
+          n.network_id === current.network_id &&
+          n.id !== current.id &&
+          (n.unsafe_routes ?? []).some((r) => sources.includes(r.source))
+      )
+      .sort((a, b) => a.hostname.localeCompare(b.hostname));
+  };
+
+  /** "Used by" disclosure for one route row: which groups and individual hosts on this
+   * network may actually route to it via this node, added one at a time from a group
+   * dropdown and a host dropdown. Shared by the exit-node toggle and every
+   * advertised-subnet / manual route row. */
+  const renderConsumerPicker = (
+    key: string,
+    entry: Pick<UnsafeRoute, "consumers" | "consumer_groups"> | undefined,
+    onChange: (consumers: number[], consumerGroups: string[]) => void
+  ) => {
+    // Defensive: entries saved before "consumers"/"consumer_groups" existed have them
+    // missing from the stored JSON, not just empty - a real node hit this.
+    const consumers = entry?.consumers ?? [];
+    const consumerGroups = entry?.consumer_groups ?? [];
+    const current = deviceDetailsModal.node;
+    const networkNodes = nodes.filter((n) => n.network_id === current?.network_id);
+    const hostOptions = networkNodes
+      .filter((n) => n.id !== current?.id && !consumers.includes(n.id))
+      .sort((a, b) => a.hostname.localeCompare(b.hostname));
+    const groupOptions = [...new Set([...editGroupOptions, ...networkNodes.flatMap((n) => n.groups ?? [])])]
+      .filter((g) => g && !consumerGroups.includes(g))
+      .sort((a, b) => a.localeCompare(b));
+    const hostName = (id: number) => nodes.find((n) => n.id === id)?.hostname ?? `Node #${id}`;
+    const selection = consumerPickerSelections[key] ?? { group: "", host: "" };
+    const setSelection = (next: Partial<{ group: string; host: string }>) =>
+      setConsumerPickerSelections((prev) => ({ ...prev, [key]: { ...selection, ...next } }));
+    const expanded = expandedConsumerPickers.has(key);
+    const editing = deviceDetailsModal.isEditing;
+    const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+    const summaryParts = [
+      consumerGroups.length ? plural(consumerGroups.length, "group") : "",
+      consumers.length ? plural(consumers.length, "host") : "",
+    ].filter(Boolean);
+    const rowClass = "flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300";
+    return (
+      <div className="mt-1">
+        <button
+          type="button"
+          onClick={() => toggleConsumerPickerExpanded(key)}
+          className="flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"
+        >
+          {expanded ? (
+            <HiChevronDown className="w-3.5 h-3.5" />
+          ) : (
+            <HiChevronRight className="w-3.5 h-3.5" />
+          )}
+          Used by {summaryParts.length ? summaryParts.join(", ") : "nobody yet"}
+        </button>
+        {expanded && (
+          <div className="mt-1.5 ml-4 space-y-2">
+            {consumerGroups.length === 0 && consumers.length === 0 && (
+              <p className="text-xs text-gray-400 dark:text-gray-500">
+                No groups or hosts yet - this route isn't used by anyone.
+              </p>
+            )}
+            {consumerGroups.map((g) => (
+              <div key={`g_${g}`} className={rowClass}>
+                <span>
+                  <span className="text-gray-500 dark:text-gray-400">Group:</span> {g}
+                </span>
+                {editing && (
+                  <Button
+                    type="button"
+                    size="xs"
+                    color="gray"
+                    aria-label={`Remove group ${g}`}
+                    onClick={() => onChange(consumers, consumerGroups.filter((x) => x !== g))}
+                  >
+                    <HiTrash className="w-3 h-3" />
+                  </Button>
+                )}
+              </div>
+            ))}
+            {consumers.map((id) => (
+              <div key={`h_${id}`} className={rowClass}>
+                <span>
+                  <span className="text-gray-500 dark:text-gray-400">Host:</span> {hostName(id)}
+                </span>
+                {editing && (
+                  <Button
+                    type="button"
+                    size="xs"
+                    color="gray"
+                    aria-label={`Remove host ${hostName(id)}`}
+                    onClick={() => onChange(consumers.filter((x) => x !== id), consumerGroups)}
+                  >
+                    <HiTrash className="w-3 h-3" />
+                  </Button>
+                )}
+              </div>
+            ))}
+            {editing && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Select
+                    sizing="sm"
+                    aria-label="Group"
+                    value={selection.group}
+                    onChange={(e) => setSelection({ group: e.target.value })}
+                    className="min-w-0 flex-1"
+                  >
+                    <option value="">
+                      {groupOptions.length ? "Select a group" : "No groups to add"}
+                    </option>
+                    {groupOptions.map((g) => (
+                      <option key={g} value={g}>
+                        {g}
+                      </option>
+                    ))}
+                  </Select>
+                  <Button
+                    type="button"
+                    size="sm"
+                    color="gray"
+                    disabled={!selection.group}
+                    onClick={() => {
+                      onChange(consumers, [...consumerGroups, selection.group].sort());
+                      setSelection({ group: "" });
+                    }}
+                  >
+                    Add
+                  </Button>
+                </div>
+                <div className="flex items-center gap-2 min-w-0">
+                  <Select
+                    sizing="sm"
+                    aria-label="Host"
+                    value={selection.host}
+                    onChange={(e) => setSelection({ host: e.target.value })}
+                    className="min-w-0 flex-1"
+                  >
+                    <option value="">
+                      {hostOptions.length ? "Select a host" : "No hosts to add"}
+                    </option>
+                    {hostOptions.map((n) => (
+                      <option key={n.id} value={String(n.id)}>
+                        {n.hostname}
+                      </option>
+                    ))}
+                  </Select>
+                  <Button
+                    type="button"
+                    size="sm"
+                    color="gray"
+                    disabled={!selection.host}
+                    onClick={() => {
+                      onChange([...consumers, Number(selection.host)], consumerGroups);
+                      setSelection({ host: "" });
+                    }}
+                  >
+                    Add
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const hasDeviceDetailsFormChanges = (): boolean => {
+    const node = deviceDetailsModal.node;
+    if (!node) return false;
+    const nodeGroup = (node.groups && node.groups[0]) ?? "";
+    const formGroup = deviceDetailsForm.group ?? "";
+    const groupEqual = (formGroup.trim() || "") === (nodeGroup.trim() || "");
+    const opts = node.lighthouse_options;
+    const logOpts = node.logging_options;
+    const routesEqual = (a: UnsafeRoute[], b: UnsafeRoute[]) => {
+      const norm = (rs: UnsafeRoute[]) =>
+        [...rs]
+          .map(
+            (r) =>
+              `${r.route}:${[...(r.consumers ?? [])].sort((x, y) => x - y).join(",")}:${[...(r.consumer_groups ?? [])].sort().join(",")}`
+          )
+          .sort()
+          .join("|");
+      return norm(a) === norm(b);
+    };
+    return (
+      !groupEqual ||
+      deviceDetailsForm.platform !== node.platform ||
+      deviceDetailsForm.is_lighthouse !== node.is_lighthouse ||
+      deviceDetailsForm.is_relay !== node.is_relay ||
+      (deviceDetailsForm.public_endpoint ?? "") !== (node.public_endpoint ?? "") ||
+      deviceDetailsForm.advertise_addrs.join(",") !== (node.advertise_addrs ?? []).join(",") ||
+      String(deviceDetailsForm.interval_seconds ?? 60) !== String(opts?.interval_seconds ?? 60) ||
+      (deviceDetailsForm.log_level ?? "info") !== (logOpts?.level ?? "info") ||
+      (deviceDetailsForm.log_format ?? "text") !== (logOpts?.format ?? "text") ||
+      deviceDetailsForm.log_disable_timestamp !== (logOpts?.disable_timestamp ?? false) ||
+      (deviceDetailsForm.log_timestamp_format ?? "") !== (logOpts?.timestamp_format ?? "") ||
+      deviceDetailsForm.punchy_respond !== (node.punchy_options?.respond ?? true) ||
+      (deviceDetailsForm.punchy_delay ?? "") !== (node.punchy_options?.delay ?? "") ||
+      (deviceDetailsForm.punchy_respond_delay ?? "") !== (node.punchy_options?.respond_delay ?? "") ||
+      !routesEqual(deviceDetailsForm.unsafe_routes, node.unsafe_routes ?? []) ||
+      deviceDetailsForm.subnet_router_id !== findSubnetRouterId(node) ||
+      deviceDetailsForm.exit_node_id !== findExitNodeId(node)
+    );
+  };
+
+  const handleSaveDeviceDetails = (e: React.FormEvent) => {
+    e.preventDefault();
+    const node = deviceDetailsModal.node;
+    if (!node) return;
+    if (
+      deviceDetailsForm.is_lighthouse === false &&
+      node.is_lighthouse === true &&
+      isOnlyLighthouseInNetwork(node)
+    ) {
+      setError("Cannot remove the only lighthouse. Designate another node as lighthouse first.");
+      return;
+    }
+    if (
+      deviceDetailsForm.platform !== "desktop" &&
+      (deviceDetailsForm.is_lighthouse || deviceDetailsForm.is_relay)
+    ) {
+      setError("Mobile nodes cannot be a lighthouse or relay. Unset those first.");
+      return;
+    }
+    const convertedToMobile = node.platform === "desktop" && deviceDetailsForm.platform !== "desktop";
+    setSaving(true);
+    const group = deviceDetailsForm.group?.trim() || null;
+    const lighthouse_options: LighthouseOptions = {
+      interval_seconds: parseInt(deviceDetailsForm.interval_seconds, 10) || 60,
+    };
+    const logging_options: LoggingOptions = {
+      level: (deviceDetailsForm.log_level || "info") as LoggingOptions["level"],
+      format: (deviceDetailsForm.log_format || "text") as LoggingOptions["format"],
+      disable_timestamp: deviceDetailsForm.log_disable_timestamp,
+      timestamp_format: deviceDetailsForm.log_timestamp_format.trim() || undefined,
+    };
+    const punchy_options: PunchyOptions = {
+      respond: deviceDetailsForm.punchy_respond,
+      delay: deviceDetailsForm.punchy_delay.trim() || undefined,
+      respond_delay: deviceDetailsForm.punchy_respond_delay.trim() || undefined,
+    };
+    const subnetRouterChanged = deviceDetailsForm.subnet_router_id !== findSubnetRouterId(node);
+    const exitNodeChanged = deviceDetailsForm.exit_node_id !== findExitNodeId(node);
+    Promise.all([
+      updateNode(node.id, {
+        is_lighthouse: deviceDetailsForm.is_lighthouse,
+        is_relay: deviceDetailsForm.is_relay,
+        // "" (not null) when blank: the API treats null as "unchanged", so null could never clear it
+        public_endpoint: deviceDetailsForm.public_endpoint.trim(),
+        advertise_addrs: deviceDetailsForm.advertise_addrs,
+        group,
+        lighthouse_options,
+        logging_options,
+        punchy_options,
+        platform: deviceDetailsForm.platform,
+        unsafe_routes: deviceDetailsForm.unsafe_routes,
+      }),
+      subnetRouterChanged ? setSubnetRouter(node.id, deviceDetailsForm.subnet_router_id) : Promise.resolve(null),
+      exitNodeChanged ? setExitNode(node.id, deviceDetailsForm.exit_node_id) : Promise.resolve(null),
+    ])
+      .then(([result]) => {
+        setDeviceDetailsModal((s) => ({ ...s, showSaved: true, savedFading: false, certResigned: !!result.cert_resigned }));
+        setTimeout(() => setDeviceDetailsModal((s) => ({ ...s, savedFading: true })), 500);
+        setTimeout(() => {
+          if (convertedToMobile) {
+            closeDeviceDetailsModal();
+            setMobileConfigPanel({
+              open: true,
+              nodeId: node.id,
+              hostname: node.hostname,
+              platform: deviceDetailsForm.platform,
+              enableDns: false,
+              reissued: false,
+            });
+            loadNodes();
+            return;
+          }
+          getNode(node.id).then((updated) => {
+            setDeviceDetailsModal((s) => ({ ...s, node: updated, isEditing: false, showSaved: false, savedFading: false, certResigned: false }));
+            setDeviceDetailsForm({
+              group: (updated.groups && updated.groups[0]) ?? "",
+              is_lighthouse: updated.is_lighthouse,
+              is_relay: updated.is_relay,
+              public_endpoint: updated.public_endpoint ?? "",
+              advertise_addrs: updated.advertise_addrs ?? [],
+              interval_seconds: String(updated.lighthouse_options?.interval_seconds ?? 60),
+              log_level: updated.logging_options?.level ?? "info",
+              log_format: updated.logging_options?.format ?? "text",
+              log_disable_timestamp: updated.logging_options?.disable_timestamp ?? false,
+              log_timestamp_format: updated.logging_options?.timestamp_format ?? "",
+              punchy_respond: updated.punchy_options?.respond ?? true,
+              punchy_delay: updated.punchy_options?.delay ?? "",
+              punchy_respond_delay: updated.punchy_options?.respond_delay ?? "",
+              platform: updated.platform,
+              unsafe_routes: updated.unsafe_routes ?? [],
+              // Derived cross-node, so `nodes` (refreshed async by loadNodes() below)
+              // may still be stale here - the values we just saved are already correct.
+              subnet_router_id: deviceDetailsForm.subnet_router_id,
+              exit_node_id: deviceDetailsForm.exit_node_id,
+            });
+          });
+          loadNodes();
+        }, 2000);
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setSaving(false));
+  };
+
+  const openReEnrollModal = (node: Node) => {
+    setReEnrollModal({ open: true, node, processing: false });
+  };
+
+  const closeReEnrollModal = () => {
+    setReEnrollModal({ open: false, node: null, processing: false });
+  };
+
+  const handleReEnrollConfirm = () => {
+    const node = reEnrollModal.node;
+    if (!node) return;
+    const isMobile = node.platform !== "desktop";
+    setReEnrollModal((s) => ({ ...s, processing: true }));
+    reenrollNode(node.id)
+      .then(() => {
+        closeReEnrollModal();
+        closeDeviceDetailsModal();
+        loadNodes();
+        if (isMobile) {
+          setMobileConfigPanel({
+            open: true,
+            nodeId: node.id,
+            hostname: node.hostname,
+            platform: node.platform,
+            enableDns: false,
+            reissued: true,
+          });
+          return;
+        }
+        return createEnrollmentCode(node.id, 24).then((enrollData) => {
+          setEnrollmentCodeModal({
+            open: true,
+            data: enrollData,
+            nodeId: enrollData.node_id,
+            loading: false,
+            enrollmentSuccess: false,
+          });
+        });
+      })
+      .catch((e) => setError(e.message))
+      .finally(() => setReEnrollModal((s) => ({ ...s, processing: false })));
+  };
+
+  const openRevokeModal = (node: Node) => {
+    setRevokeModal({ open: true, node, step: 1, typedHostname: "", processing: false });
+  };
+
+  const closeRevokeModal = () => {
+    setRevokeModal({ open: false, node: null, step: 1, typedHostname: "", processing: false });
+  };
+
+  const handleRevokeConfirm = async () => {
+    const node = revokeModal.node;
+    if (!node) return;
+    setRevokeModal((s) => ({ ...s, processing: true }));
+    try {
+      await startReauthFlow({ kind: "node-revoke-cert", nodeId: node.id, hostname: node.hostname });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to start reauthentication");
+      setRevokeModal((s) => ({ ...s, processing: false }));
+    }
+  };
+
+  const handleDownloadConfig = async (node: Node) => {
+    // Plain re-download: iOS's DNS block is automatic (no opt-in needed) so
+    // this already gets it; Android's DNS override is opt-in and isn't
+    // persisted anywhere, so a bare re-download never silently re-enables it -
+    // use the mobile config panel's checkbox (creation or re-enroll) for that.
+    setDownloadError(null);
+    try {
+      const blob = await getNodeConfigBlob(node.id);
+      downloadBlob(blob, `${node.hostname}.yaml`);
+    } catch (e) {
+      setDownloadError(e instanceof Error ? e.message : "Download failed");
+    }
+  };
+
+  const closeMobileConfigPanel = () => {
+    setMobileConfigPanel({ open: false, nodeId: null, hostname: "", platform: "desktop", enableDns: false, reissued: false });
+  };
+
+  const handleDownloadMobileConfig = async () => {
+    if (!mobileConfigPanel.nodeId) return;
+    setDownloadError(null);
+    try {
+      const blob = await getNodeConfigBlob(mobileConfigPanel.nodeId, { enableDns: mobileConfigPanel.enableDns });
+      downloadBlob(blob, `${mobileConfigPanel.hostname}.yaml`);
+    } catch (e) {
+      setDownloadError(e instanceof Error ? e.message : "Download failed");
+    }
+  };
+
+  const openEnrollmentCodeModal = (node: Node) => {
+    setEnrollmentCodeModal({
+      open: true,
+      data: null,
+      nodeId: node.id,
+      loading: true,
+      enrollmentSuccess: false,
+    });
+    createEnrollmentCode(node.id, 24)
+      .then((data) =>
+        setEnrollmentCodeModal((s) => ({ ...s, data, loading: false }))
+      )
+      .catch((e) => {
+        setError(e.message);
+        setEnrollmentCodeModal((s) => ({ ...s, loading: false, nodeId: null }));
+      });
+  };
+
+  const closeEnrollmentCodeModal = () => {
+    setEnrollmentCodeModal({
+      open: false,
+      data: null,
+      nodeId: null,
+      loading: false,
+      enrollmentSuccess: false,
+    });
+  };
+
+  const handleEnrollmentContinue = () => {
+    closeEnrollmentCodeModal();
+    loadNodes();
+  };
+
+  // Poll for enrollment success (first_polled_at) while enrollment section is visible
+  useEffect(() => {
+    if (
+      !enrollmentCodeModal.open ||
+      !enrollmentCodeModal.nodeId ||
+      enrollmentCodeModal.enrollmentSuccess ||
+      enrollmentCodeModal.loading
+    ) {
+      return;
+    }
+    const interval = setInterval(() => {
+      getNode(enrollmentCodeModal.nodeId!)
+        .then((node) => {
+          if (node.first_polled_at) {
+            setEnrollmentCodeModal((s) => ({ ...s, enrollmentSuccess: true }));
+          }
+        })
+        .catch(() => {});
+    }, 2500);
+    return () => clearInterval(interval);
+  }, [
+    enrollmentCodeModal.open,
+    enrollmentCodeModal.nodeId,
+    enrollmentCodeModal.enrollmentSuccess,
+    enrollmentCodeModal.loading,
+  ]);
+
+  const getStatusBadge = (status: string) => {
+    switch (status) {
+      case "active":
+        return (
+          <Badge color="success" icon={HiCheckCircle}>
+            Active
+          </Badge>
+        );
+      case "offline":
+        return (
+          <Badge color="failure" icon={HiXCircle}>
+            Offline
+          </Badge>
+        );
+      case "pending":
+        return (
+          <Badge color="warning" icon={HiClock}>
+            Pending
+          </Badge>
+        );
+      default:
+        return <Badge color="gray">{status}</Badge>;
+    }
+  };
+
+  return (
+    <div>
+      <h1 className="text-3xl font-bold mb-6">Nodes</h1>
+
+
+      {loading ? (
+        <Card>
+          <p className="text-gray-600 dark:text-gray-400">Loading nodes...</p>
+        </Card>
+      ) : (
+        <Card>
+          <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
+            <div className="flex items-center gap-2">
+              <Label htmlFor="filter_network" value="Network" className="sr-only" />
+              <Select
+                id="filter_network"
+                value={filterNetworkId === "" ? "" : String(filterNetworkId)}
+                onChange={(e) =>
+                  setFilterNetworkId(e.target.value === "" ? "" : parseInt(e.target.value, 10))
+                }
+              >
+                <option value="">All networks</option>
+                {networks.map((net) => (
+                  <option key={net.id} value={net.id}>
+                    {net.name}
+                  </option>
+                ))}
+              </Select>
+              <Button
+                color={showCreateNodeForm ? "gray" : "purple"}
+                onClick={() => {
+                  setShowCreateNodeForm((v) => !v);
+                  setNodeNameError(null);
+                  setSuggestedIpError(null);
+                }}
+                data-onboarding-target="nodes-create-button"
+              >
+                <HiPlus className="mr-2 h-5 w-5" />
+                {showCreateNodeForm ? "Cancel" : "Create Node"}
+              </Button>
+            </div>
+          </div>
+
+          {showCreateNodeForm && (
+            <div className="mb-6 p-4 border border-gray-200 dark:border-gray-700 rounded-lg">
+              <h2 className="text-xl font-semibold mb-4">Create Node</h2>
+              <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
+                This will generate the config and certificate for the node.
+              </p>
+              {networks.length === 0 ? (
+                <p className="text-gray-600 dark:text-gray-400">Create a network first on the Networks page.</p>
+              ) : (
+                <form onSubmit={handleCreateNodeSubmit} className="space-y-4">
+                  <div>
+                    <Label htmlFor="create_node_network" value="Network" />
+                    <Select
+                      id="create_node_network"
+                      value={String(createNodeForm.network_id)}
+                      onChange={(e) => {
+                        const v = parseInt(e.target.value, 10);
+                        setCreateNodeForm((f) => ({
+                          ...f,
+                          network_id: v,
+                          is_lighthouse: nodes.filter((n) => n.network_id === v).length === 0 ? true : f.is_lighthouse,
+                        }));
+                        setNodeNameError(null);
+                        setSuggestedIpError(null);
+                      }}
+                      required
+                    >
+                      <option value="0">Select a network</option>
+                      {networks.map((n) => (
+                        <option key={n.id} value={n.id}>
+                          {n.name} ({n.subnet_cidr})
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
+                  <div>
+                    <Label htmlFor="create_node_platform" value="Platform" />
+                    <Select
+                      id="create_node_platform"
+                      value={createNodeForm.platform}
+                      onChange={(e) => {
+                        const platform = e.target.value as NodePlatform;
+                        setCreateNodeForm((f) => ({
+                          ...f,
+                          platform,
+                          // Mobile devices can't be a lighthouse or relay.
+                          is_lighthouse: platform === "desktop" ? f.is_lighthouse : false,
+                          is_relay: platform === "desktop" ? f.is_relay : false,
+                          android_dns_opt_in: platform === "android" ? f.android_dns_opt_in : false,
+                        }));
+                      }}
+                    >
+                      <option value="desktop">Desktop (runs ncclient)</option>
+                      <option value="ios">iOS (Mobile Nebula app)</option>
+                      <option value="android">Android (Mobile Nebula app)</option>
+                    </Select>
+                    {createNodeForm.platform !== "desktop" && (
+                      <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
+                        Mobile nodes skip enrollment - after creation you'll download a config file
+                        to import into the Mobile Nebula app (Add Site → From file).
+                      </p>
+                    )}
+                  </div>
+                  <div>
+                    <Label htmlFor="create_node_name" value="Node name (hostname)" />
+                    <TextInput
+                      id="create_node_name"
+                      type="text"
+                      value={createNodeForm.name}
+                      onChange={(e) => {
+                        setCreateNodeForm((f) => ({ ...f, name: e.target.value }));
+                        setNodeNameError(null);
+                      }}
+                      onBlur={handleCreateNodeNameBlur}
+                      placeholder="my-laptop"
+                      required
+                      color={nodeNameError ? "failure" : undefined}
+                      helperText={nodeNameError}
+                    />
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <Label htmlFor="create_node_group" value="Group (one role, e.g. servers)" />
+                      {createGroupOptions.length === 0 ? (
+                        <>
+                          <Select
+                            id="create_node_group"
+                            value=""
+                            disabled
+                            className="w-full"
+                          >
+                            <option value="">No groups configured</option>
+                          </Select>
+                          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
+                            In order to use groups, please add one first.
+                          </p>
+                        </>
+                      ) : (
+                        <Select
+                          id="create_node_group"
+                          value={createNodeForm.group}
+                          onChange={(e) => setCreateNodeForm((f) => ({ ...f, group: e.target.value }))}
+                          className="w-full"
+                        >
+                          <option value="">No group</option>
+                          {createGroupOptions.map((g) => (
+                            <option key={g} value={g}>
+                              {g}
+                            </option>
+                          ))}
+                        </Select>
+                      )}
+                    </div>
+                    <div>
+                      <Label htmlFor="create_node_suggested_ip" value="Suggested IP (optional)" />
+                      <TextInput
+                        id="create_node_suggested_ip"
+                        type="text"
+                        value={createNodeForm.suggested_ip}
+                        onChange={(e) => {
+                          setCreateNodeForm((f) => ({ ...f, suggested_ip: e.target.value }));
+                          setSuggestedIpError(null);
+                        }}
+                        onBlur={handleSuggestedIpBlur}
+                        placeholder="10.100.0.10"
+                        color={suggestedIpError ? "failure" : undefined}
+                        helperText={suggestedIpError}
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <Label htmlFor="create_node_duration" value="Certificate validity (days)" />
+                    <TextInput
+                      id="create_node_duration"
+                      type="number"
+                      value={createNodeForm.duration_days}
+                      onChange={(e) => setCreateNodeForm((f) => ({ ...f, duration_days: e.target.value }))}
+                      min={1}
+                      max={3650}
+                    />
+                  </div>
+                  <div className="flex flex-wrap items-center gap-4">
+                    <div className="flex items-center gap-2">
+                      <Checkbox
+                        id="create_node_lighthouse"
+                        checked={createNodeForm.is_lighthouse}
+                        disabled={createNodeForm.platform !== "desktop"}
+                        onChange={(e) =>
+                          setCreateNodeForm((f) => ({ ...f, is_lighthouse: e.target.checked }))
+                        }
+                      />
+                      <Label htmlFor="create_node_lighthouse">Lighthouse</Label>
+                      {createNodeForm.platform !== "desktop" ? (
+                        <span className="text-sm text-gray-500 dark:text-gray-400">
+                          Mobile nodes cannot be a lighthouse.
+                        </span>
+                      ) : (
+                        isFirstNodeInNetwork(createNodeForm.network_id) && (
+                          <span className="text-sm text-gray-500 dark:text-gray-400">
+                            The first node in this network should be a lighthouse so it can accept inbound connections.
+                          </span>
+                        )
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Checkbox
+                        id="create_node_relay"
+                        checked={createNodeForm.is_relay}
+                        disabled={createNodeForm.platform !== "desktop"}
+                        onChange={(e) =>
+                          setCreateNodeForm((f) => ({ ...f, is_relay: e.target.checked }))
+                        }
+                      />
+                      <Label htmlFor="create_node_relay">Relay</Label>
+                      {createNodeForm.platform !== "desktop" && (
+                        <span className="text-sm text-gray-500 dark:text-gray-400">
+                          Mobile nodes cannot be a relay.
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  {createNodeForm.platform === "android" && (
+                    <div className="flex items-start gap-2">
+                      <Checkbox
+                        id="create_node_android_dns"
+                        checked={createNodeForm.android_dns_opt_in}
+                        onChange={(e) =>
+                          setCreateNodeForm((f) => ({ ...f, android_dns_opt_in: e.target.checked }))
+                        }
+                        className="mt-1"
+                      />
+                      <Label htmlFor="create_node_android_dns" className="font-normal">
+                        Enable split-horizon DNS (full override - Android has no domain-scoping, so
+                        <strong> all</strong> device DNS routes through this network's lighthouse(s)
+                        while connected, and breaks entirely if they're unreachable). Off by default.
+                      </Label>
+                    </div>
+                  )}
+                  <div>
+                    <Label htmlFor="create_node_public_endpoint" value="Public endpoint (hostname:port or IP:port)" />
+                    <TextInput
+                      id="create_node_public_endpoint"
+                      value={createNodeForm.public_endpoint}
+                      onChange={(e) =>
+                        setCreateNodeForm((f) => ({ ...f, public_endpoint: e.target.value }))
+                      }
+                      placeholder="node.example.com:4242"
+                      helperText={PUBLIC_ENDPOINT_HELP}
+                    />
+                  </div>
+                  {createNodeForm.is_lighthouse && (
+                    <div>
+                      <Label htmlFor="create_node_interval" value="Report interval (seconds)" />
+                      <TextInput
+                        id="create_node_interval"
+                        type="number"
+                        value={createNodeForm.interval_seconds}
+                        onChange={(e) =>
+                          setCreateNodeForm((f) => ({ ...f, interval_seconds: e.target.value }))
+                        }
+                        className="w-24"
+                      />
+                    </div>
+                  )}
+                  <Button
+                    type="submit"
+                    color="purple"
+                    isProcessing={createSubmitting}
+                    disabled={createSubmitting || !!nodeNameError || !!suggestedIpError}
+                  >
+                    Create Node
+                  </Button>
+                </form>
+              )}
+            </div>
+          )}
+
+          {enrollmentCodeModal.open && (
+            <Card className="mb-4">
+              <h3 className="text-lg font-semibold text-[var(--nc-bg2-light-contrast)] dark:text-[var(--nc-bg2-dark-contrast)]">
+                Enrollment code for {enrollmentCodeModal.nodeId != null ? (nodes.find((n) => n.id === enrollmentCodeModal.nodeId)?.hostname ?? `Node ${enrollmentCodeModal.nodeId}`) : "new node"}
+              </h3>
+              <div className="pt-2">
+                {enrollmentCodeModal.loading && (
+                  <p className="text-gray-600 dark:text-gray-400">Generating code...</p>
+                )}
+                {enrollmentCodeModal.data && (
+                  <div className="space-y-4">
+                    <p className="text-sm text-gray-600 dark:text-gray-400">
+                      Use this code once on the device to enroll. Expires:{" "}
+                      {new Date(enrollmentCodeModal.data.expires_at).toLocaleString()}.
+                    </p>
+                    <div>
+                      <div className="flex flex-wrap gap-2 justify-between items-center mb-1">
+                        <Label value="Code" />
+                        <Button
+                          size="xs"
+                          color="gray"
+                          onClick={() =>
+                            enrollmentCodeModal.data &&
+                            navigator.clipboard.writeText(enrollmentCodeModal.data.code)
+                          }
+                        >
+                          <HiClipboard className="w-4 h-4 mr-1" /> Copy
+                        </Button>
+                      </div>
+                      <p className="mt-1 p-3 bg-gray-100 dark:bg-gray-800 rounded font-mono text-lg">
+                        {enrollmentCodeModal.data.code}
+                      </p>
+                    </div>
+                    <p className="text-sm text-gray-600 dark:text-gray-400">
+                      On the device, run (replace with your Nebula Commander URL if needed):
+                    </p>
+                    <div className="flex flex-wrap gap-2 justify-between items-start">
+                      <pre className="flex-1 min-w-0 p-3 bg-gray-100 dark:bg-gray-800 rounded text-xs overflow-x-auto whitespace-pre">
+                        {`ncclient --server ${typeof window !== "undefined" && window.location?.origin ? window.location.origin : "http://your-server"} enroll --code ${enrollmentCodeModal.data.code}`}
+                      </pre>
+                      <Button
+                        size="xs"
+                        color="gray"
+                        className="shrink-0"
+                        onClick={() => {
+                          const server =
+                            typeof window !== "undefined" && window.location?.origin
+                              ? window.location.origin
+                              : "http://your-server";
+                          const cmd = `ncclient --server ${server} enroll --code ${enrollmentCodeModal.data!.code}`;
+                          navigator.clipboard.writeText(cmd);
+                        }}
+                      >
+                        <HiClipboard className="w-4 h-4 mr-1" /> Copy
+                      </Button>
+                    </div>
+                    <p className="text-sm text-gray-600 dark:text-gray-400">
+                      Then run <code className="bg-gray-200 dark:bg-gray-700 px-1 rounded">ncclient --server &lt;URL&gt; run</code> to poll for config and certs every minute.
+                    </p>
+                    <div className="flex items-center gap-2 pt-2">
+                      {enrollmentCodeModal.enrollmentSuccess ? (
+                        <>
+                          <span
+                            className="flex h-3 w-3 rounded-full bg-green-500"
+                            title="Enrollment successful"
+                          />
+                          <span className="text-green-600 dark:text-green-400 font-medium">
+                            Enrollment Successful!
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <span
+                            className="flex h-3 w-3 rounded-full bg-red-500 animate-pulse"
+                            title="Waiting for enrollment"
+                          />
+                          <span className="text-red-600 dark:text-red-400">Waiting for enrollment</span>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className="flex flex-wrap gap-2 pt-4 border-t border-gray-200 dark:border-gray-700 mt-4">
+                <Button color="gray" onClick={closeEnrollmentCodeModal}>
+                  {enrollmentCodeModal.enrollmentSuccess ? "Close" : "Cancel"}
+                </Button>
+                {enrollmentCodeModal.enrollmentSuccess && (
+                  <Button color="success" onClick={handleEnrollmentContinue}>
+                    Continue
+                  </Button>
+                )}
+              </div>
+            </Card>
+          )}
+
+          {mobileConfigPanel.open && (
+            <Card className="mb-4">
+              <h3 className="text-lg font-semibold text-[var(--nc-bg2-light-contrast)] dark:text-[var(--nc-bg2-dark-contrast)]">
+                {mobileConfigPanel.reissued ? "Certificate reissued for " : "Mobile config ready for "}
+                {mobileConfigPanel.hostname} ({mobileConfigPanel.platform === "ios" ? "iOS" : "Android"})
+              </h3>
+              <div className="pt-2 space-y-4">
+                {mobileConfigPanel.reissued && (
+                  <p className="text-sm text-gray-600 dark:text-gray-400">
+                    The old config file is no longer valid - download the new one below and
+                    re-import it into Mobile Nebula (Add Site → From file), replacing the old site.
+                  </p>
+                )}
+                {mobileConfigPanel.platform === "android" && (
+                  <div className="flex items-start gap-2">
+                    <Checkbox
+                      id="mobile_panel_android_dns"
+                      checked={mobileConfigPanel.enableDns}
+                      onChange={(e) =>
+                        setMobileConfigPanel((s) => ({ ...s, enableDns: e.target.checked }))
+                      }
+                      className="mt-1"
+                    />
+                    <Label htmlFor="mobile_panel_android_dns" className="font-normal">
+                      Enable split-horizon DNS (full override - all device DNS routes through this
+                      network's lighthouse(s) while connected). Off by default.
+                    </Label>
+                  </div>
+                )}
+                <p className="text-sm text-gray-600 dark:text-gray-400">
+                  Download the config file, then in Mobile Nebula: <strong>Add Site → From file</strong>{" "}
+                  and select the downloaded file.
+                </p>
+                <Button color="purple" onClick={handleDownloadMobileConfig}>
+                  <HiDownload className="w-4 h-4 mr-1" />
+                  Download config.yaml
+                </Button>
+              </div>
+              <div className="flex flex-wrap gap-2 pt-4 border-t border-gray-200 dark:border-gray-700 mt-4">
+                <Button color="gray" onClick={closeMobileConfigPanel}>
+                  Close
+                </Button>
+              </div>
+            </Card>
+          )}
+
+          <div className="lg:w-2/3">
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+              {nodes.map((n) => {
+                const cardStatus = getCardStatus(n);
+                const statusBg =
+                  cardStatus === "active"
+                    ? resolve("status.active")
+                    : cardStatus === "inactive"
+                    ? resolve("status.inactive")
+                    : resolve("status.neverActive");
+                const badgeStyle = (bg: string) => ({ backgroundColor: bg, color: contrastTextColor(bg) });
+                const statusTextColor = contrastTextColor(statusBg);
+                return (
+                  <button
+                    key={n.id}
+                    type="button"
+                    onClick={() => openDeviceDetails(n)}
+                    className="relative aspect-square rounded-lg border border-gray-200 dark:border-gray-700 p-3 text-left shadow-sm hover:shadow-md transition-shadow"
+                    style={{ backgroundColor: statusBg }}
+                  >
+                    <div className="absolute top-2 left-3 right-3 z-10">
+                      <p className="font-semibold truncate" style={{ color: statusTextColor }} title={n.hostname}>
+                        {n.hostname}
+                      </p>
+                      <p
+                        className="text-xs font-mono truncate mt-1"
+                        style={{ color: statusTextColor, opacity: 0.75 }}
+                      >
+                        {n.ip_address || "—"}
+                      </p>
+                    </div>
+                    <div className="absolute bottom-2 right-2 flex flex-wrap justify-end gap-1">
+                      {n.is_lighthouse && (
+                        <Badge size="sm" style={badgeStyle(resolve("badge.lighthouse"))}>
+                          Lighthouse
+                        </Badge>
+                      )}
+                      {n.is_relay && (
+                        <Badge size="sm" style={badgeStyle(resolve("badge.relay"))}>
+                          Relay
+                        </Badge>
+                      )}
+                      {n.platform === "ios" && (
+                        <Badge size="sm" style={badgeStyle(resolve("badge.ios"))}>
+                          iOS
+                        </Badge>
+                      )}
+                      {n.platform === "android" && (
+                        <Badge size="sm" style={badgeStyle(resolve("badge.android"))}>
+                          Android
+                        </Badge>
+                      )}
+                      {n.platform === "desktop" && n.os_platform === "windows" && (
+                        <Badge size="sm" style={badgeStyle(resolve("badge.windows"))}>
+                          Windows
+                        </Badge>
+                      )}
+                      {n.platform === "desktop" && n.os_platform === "linux" && (
+                        <Badge size="sm" style={badgeStyle(resolve("badge.linux"))}>
+                          Linux
+                        </Badge>
+                      )}
+                      {n.platform === "desktop" && n.os_platform === "macos" && (
+                        <Badge size="sm" style={badgeStyle(resolve("badge.macos"))}>
+                          macOS
+                        </Badge>
+                      )}
+                      {!n.is_lighthouse && !n.is_relay && n.platform === "desktop" && !n.os_platform && (
+                        <Badge size="sm" style={badgeStyle(resolve("badge.node"))}>
+                          Node
+                        </Badge>
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+            {nodes.length === 0 && (
+              <div className="p-4 text-center text-gray-500 dark:text-gray-400">
+                No nodes yet. Create a node to get started.
+              </div>
+            )}
+          </div>
+        </Card>
+      )}
+
+      <Modal show={!!deviceDetailsModal.node} onClose={closeDeviceDetailsModal} size="4xl">
+        <Modal.Header>{deviceDetailsModal.node?.hostname}</Modal.Header>
+        <Modal.Body>
+                          <div className="p-4 border-t border-gray-200 dark:border-gray-700">
+                            <form onSubmit={handleSaveDeviceDetails} className="space-y-6">
+                              {deviceDetailsModal.node && (
+                                <>
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                                    <div className="min-w-0">
+                                      <Label value="ID" className="text-gray-500 dark:text-gray-400" />
+                                      <p className="text-[var(--nc-bg2-light-contrast)] dark:text-[var(--nc-bg2-dark-contrast)] truncate" title={String(deviceDetailsModal.node.id)}>{deviceDetailsModal.node.id}</p>
+                                    </div>
+                                    <div className="min-w-0">
+                                      <Label value="Hostname" className="text-gray-500 dark:text-gray-400" />
+                                      <p className="text-[var(--nc-bg2-light-contrast)] dark:text-[var(--nc-bg2-dark-contrast)] truncate" title={deviceDetailsModal.node.hostname}>{deviceDetailsModal.node.hostname}</p>
+                                    </div>
+                                    <div className="min-w-0">
+                                      <Label value="Network" className="text-gray-500 dark:text-gray-400" />
+                                      <p className="text-[var(--nc-bg2-light-contrast)] dark:text-[var(--nc-bg2-dark-contrast)] truncate" title={getNetworkName(deviceDetailsModal.node.network_id)}>
+                                        {getNetworkName(deviceDetailsModal.node.network_id)}
+                                      </p>
+                                    </div>
+                                    <div className="min-w-0">
+                                      <Label value="IP Address" className="text-gray-500 dark:text-gray-400" />
+                                      <p className="text-[var(--nc-bg2-light-contrast)] dark:text-[var(--nc-bg2-dark-contrast)] truncate" title={deviceDetailsModal.node.ip_address || "—"}>
+                                        {deviceDetailsModal.node.ip_address || "—"}
+                                      </p>
+                                    </div>
+                                    <div className="min-w-0">
+                                      <Label value="Status" className="text-gray-500 dark:text-gray-400" />
+                                      <div className="mt-1">{getStatusBadge(deviceDetailsModal.node.status)}</div>
+                                    </div>
+                                    <div className="min-w-0">
+                                      <Label value="Created At" className="text-gray-500 dark:text-gray-400" />
+                                      <p className="text-[var(--nc-bg2-light-contrast)] dark:text-[var(--nc-bg2-dark-contrast)] truncate" title={deviceDetailsModal.node.created_at ? new Date(deviceDetailsModal.node.created_at).toLocaleString() : "—"}>
+                                        {deviceDetailsModal.node.created_at
+                                          ? new Date(deviceDetailsModal.node.created_at).toLocaleString()
+                                          : "—"}
+                                      </p>
+                                    </div>
+                                    <div className="min-w-0">
+                                      <Label value="Last Seen" className="text-gray-500 dark:text-gray-400" />
+                                      <p className="text-[var(--nc-bg2-light-contrast)] dark:text-[var(--nc-bg2-dark-contrast)] truncate" title={deviceDetailsModal.node.last_seen ? new Date(deviceDetailsModal.node.last_seen).toLocaleString() : "—"}>
+                                        {deviceDetailsModal.node.last_seen
+                                          ? new Date(deviceDetailsModal.node.last_seen).toLocaleString()
+                                          : "—"}
+                                      </p>
+                                    </div>
+                                    <div className="min-w-0">
+                                      <Label value="First Polled At" className="text-gray-500 dark:text-gray-400" />
+                                      <p className="text-[var(--nc-bg2-light-contrast)] dark:text-[var(--nc-bg2-dark-contrast)] truncate" title={deviceDetailsModal.node.first_polled_at ? new Date(deviceDetailsModal.node.first_polled_at).toLocaleString() : "—"}>
+                                        {deviceDetailsModal.node.first_polled_at
+                                          ? new Date(deviceDetailsModal.node.first_polled_at).toLocaleString()
+                                          : "—"}
+                                      </p>
+                                    </div>
+                                    {deviceDetailsModal.node.client_version && (
+                                      <div className="min-w-0 sm:col-span-2">
+                                        <Label value="Client" className="text-gray-500 dark:text-gray-400" />
+                                        <p
+                                          className="text-[var(--nc-bg2-light-contrast)] dark:text-[var(--nc-bg2-dark-contrast)]"
+                                          title="Reported by the device. Automatic updates can only be changed on the device itself."
+                                        >
+                                          {formatClientVersion(deviceDetailsModal.node.client_version)}
+                                          {" · auto-update: "}
+                                          {AUTO_UPDATE_LABELS[deviceDetailsModal.node.auto_update ?? "off"] ?? "off"}
+                                        </p>
+                                        {deviceDetailsModal.node.update_available && (
+                                          <div className="mt-1 flex">
+                                            <Badge color="warning">Update available: v{deviceDetailsModal.node.update_available}</Badge>
+                                          </div>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+
+                                  <div className="border-t border-gray-200 dark:border-gray-700 pt-4 space-y-4">
+                                    <div className="min-w-0">
+                                      <Label htmlFor="dd_platform" value="Platform" className="text-gray-500 dark:text-gray-400" />
+                                      <Select
+                                        id="dd_platform"
+                                        value={deviceDetailsForm.platform}
+                                        onChange={(e) => {
+                                          const platform = e.target.value as NodePlatform;
+                                          setDeviceDetailsForm((f) => ({
+                                            ...f,
+                                            platform,
+                                            is_lighthouse: platform === "desktop" ? f.is_lighthouse : false,
+                                            is_relay: platform === "desktop" ? f.is_relay : false,
+                                          }));
+                                        }}
+                                        disabled={!deviceDetailsModal.isEditing}
+                                        className={`min-w-0 w-full ${!deviceDetailsModal.isEditing ? "bg-gray-50 dark:bg-gray-800 cursor-default" : ""}`}
+                                      >
+                                        <option value="desktop">Desktop (runs ncclient)</option>
+                                        <option value="ios">iOS (Mobile Nebula app)</option>
+                                        <option value="android">Android (Mobile Nebula app)</option>
+                                      </Select>
+                                      {deviceDetailsModal.isEditing && deviceDetailsForm.platform !== deviceDetailsModal.node.platform && (
+                                        <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
+                                          {deviceDetailsForm.platform === "desktop"
+                                            ? "Converting to desktop - the node will show normal Enroll/Re-Enroll actions again."
+                                            : "Converting to mobile - the existing certificate is kept as-is; you'll get a config file to download for Mobile Nebula."}
+                                        </p>
+                                      )}
+                                    </div>
+                                    <div className="min-w-0">
+                                      <Label htmlFor="dd_group" value="Group (one role)" className="text-gray-500 dark:text-gray-400" />
+                                      {editGroupOptions.length === 0 ? (
+                                        <>
+                                          <Select
+                                            id="dd_group"
+                                            value=""
+                                            disabled
+                                            className={`min-w-0 w-full ${!deviceDetailsModal.isEditing ? "bg-gray-50 dark:bg-gray-800 cursor-default" : ""}`}
+                                          >
+                                            <option value="">No groups configured</option>
+                                          </Select>
+                                          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
+                                            In order to use groups, please add one first.
+                                          </p>
+                                        </>
+                                      ) : (
+                                        <Select
+                                          id="dd_group"
+                                          value={deviceDetailsForm.group}
+                                          onChange={(e) => setDeviceDetailsForm((f) => ({ ...f, group: e.target.value }))}
+                                          disabled={!deviceDetailsModal.isEditing}
+                                          className={`min-w-0 w-full ${!deviceDetailsModal.isEditing ? "bg-gray-50 dark:bg-gray-800 cursor-default" : ""}`}
+                                        >
+                                          <option value="">No group</option>
+                                          {[
+                                            ...(deviceDetailsForm.group && !editGroupOptions.includes(deviceDetailsForm.group)
+                                              ? [deviceDetailsForm.group]
+                                              : []),
+                                            ...editGroupOptions,
+                                          ].map((g) => (
+                                            <option key={g} value={g}>
+                                              {g}
+                                            </option>
+                                          ))}
+                                        </Select>
+                                      )}
+                                    </div>
+                                    <div className="flex flex-wrap items-center gap-4">
+                                      <div className="flex items-center gap-2">
+                                        <Checkbox
+                                          id="dd_is_lighthouse"
+                                          checked={deviceDetailsForm.is_lighthouse}
+                                          onChange={(e) =>
+                                            setDeviceDetailsForm((f) => ({ ...f, is_lighthouse: e.target.checked }))
+                                          }
+                                          disabled={!deviceDetailsModal.isEditing || deviceDetailsForm.platform !== "desktop"}
+                                        />
+                                        <Label htmlFor="dd_is_lighthouse">Lighthouse</Label>
+                                      </div>
+                                      <div className="flex items-center gap-2">
+                                        <Checkbox
+                                          id="dd_is_relay"
+                                          checked={deviceDetailsForm.is_relay}
+                                          onChange={(e) =>
+                                            setDeviceDetailsForm((f) => ({ ...f, is_relay: e.target.checked }))
+                                          }
+                                          disabled={!deviceDetailsModal.isEditing || deviceDetailsForm.platform !== "desktop"}
+                                        />
+                                        <Label htmlFor="dd_is_relay">Relay</Label>
+                                      </div>
+                                      {deviceDetailsForm.platform !== "desktop" && deviceDetailsModal.isEditing && (
+                                        <span className="text-sm text-gray-500 dark:text-gray-400">
+                                          Mobile nodes cannot be a lighthouse or relay.
+                                        </span>
+                                      )}
+                                    </div>
+                                    {deviceDetailsModal.isEditing &&
+                                      deviceDetailsModal.node &&
+                                      isOnlyLighthouseInNetwork(deviceDetailsModal.node) && (
+                                        <p className="text-sm text-amber-600 dark:text-amber-400">
+                                          This is the only lighthouse in the network; it cannot be unchecked until another node is set as lighthouse.
+                                        </p>
+                                      )}
+                                  </div>
+
+                                  <div className="border-t border-gray-200 dark:border-gray-700 pt-4 min-w-0">
+                                    <Label htmlFor="dd_public_endpoint" value="Public endpoint (hostname:port or IP:port)" className="text-gray-500 dark:text-gray-400" />
+                                    <TextInput
+                                      id="dd_public_endpoint"
+                                      value={deviceDetailsForm.public_endpoint}
+                                      onChange={(e) =>
+                                        setDeviceDetailsForm((f) => ({ ...f, public_endpoint: e.target.value }))
+                                      }
+                                      placeholder="node.example.com:4242"
+                                      helperText={deviceDetailsModal.isEditing ? PUBLIC_ENDPOINT_HELP : undefined}
+                                      disabled={!deviceDetailsModal.isEditing}
+                                      className={`min-w-0 w-full ${!deviceDetailsModal.isEditing ? "bg-gray-50 dark:bg-gray-800 border-none cursor-default" : ""}`}
+                                    />
+                                  </div>
+
+                                  {deviceDetailsForm.is_lighthouse && (
+                                    <div className="border-t border-gray-200 dark:border-gray-700 pt-4 space-y-4">
+                                      <div>
+                                        <p className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">
+                                          Lighthouse options
+                                        </p>
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                                          <div className="min-w-0">
+                                            <Label htmlFor="dd_interval" value="Report interval (seconds)" className="text-gray-500 dark:text-gray-400" />
+                                            <TextInput
+                                              id="dd_interval"
+                                              type="number"
+                                              value={deviceDetailsForm.interval_seconds}
+                                              onChange={(e) =>
+                                                setDeviceDetailsForm((f) => ({ ...f, interval_seconds: e.target.value }))
+                                              }
+                                              disabled={!deviceDetailsModal.isEditing}
+                                              className={`min-w-0 w-full ${!deviceDetailsModal.isEditing ? "bg-gray-50 dark:bg-gray-800 border-none cursor-default" : ""}`}
+                                            />
+                                          </div>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  <div className="border-t border-gray-200 dark:border-gray-700 pt-4 space-y-4">
+                                    <p className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">
+                                      Use a subnet router / exit node
+                                    </p>
+                                    <p className="text-xs text-gray-500 dark:text-gray-400 -mt-2">
+                                      Route this node's traffic through another node on this network that
+                                      advertises a subnet or is set up as an exit node.
+                                    </p>
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                      <div className="min-w-0">
+                                        <Label
+                                          htmlFor="dd_use_subnet_router"
+                                          value="Use Subnet Router"
+                                          className="text-gray-500 dark:text-gray-400"
+                                        />
+                                        <Select
+                                          id="dd_use_subnet_router"
+                                          value={deviceDetailsForm.subnet_router_id === null ? "" : String(deviceDetailsForm.subnet_router_id)}
+                                          onChange={(e) =>
+                                            setDeviceDetailsForm((f) => ({
+                                              ...f,
+                                              subnet_router_id: e.target.value === "" ? null : parseInt(e.target.value, 10),
+                                            }))
+                                          }
+                                          disabled={!deviceDetailsModal.isEditing}
+                                          className={`min-w-0 w-full ${!deviceDetailsModal.isEditing ? "bg-gray-50 dark:bg-gray-800 border-none cursor-default" : ""}`}
+                                        >
+                                          <option value="">None</option>
+                                          {routeGatewayCandidates(["interface", "manual"]).map((n) => (
+                                            <option key={n.id} value={String(n.id)}>
+                                              {n.hostname}
+                                            </option>
+                                          ))}
+                                        </Select>
+                                        {routeGatewayCandidates(["interface", "manual"]).length === 0 && (
+                                          <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
+                                            No other node on this network advertises a subnet yet.
+                                          </p>
+                                        )}
+                                      </div>
+                                      <div className="min-w-0">
+                                        <Label
+                                          htmlFor="dd_use_exit_node"
+                                          value="Use Exit Node"
+                                          className="text-gray-500 dark:text-gray-400"
+                                        />
+                                        <Select
+                                          id="dd_use_exit_node"
+                                          value={deviceDetailsForm.exit_node_id === null ? "" : String(deviceDetailsForm.exit_node_id)}
+                                          onChange={(e) =>
+                                            setDeviceDetailsForm((f) => ({
+                                              ...f,
+                                              exit_node_id: e.target.value === "" ? null : parseInt(e.target.value, 10),
+                                            }))
+                                          }
+                                          disabled={!deviceDetailsModal.isEditing}
+                                          className={`min-w-0 w-full ${!deviceDetailsModal.isEditing ? "bg-gray-50 dark:bg-gray-800 border-none cursor-default" : ""}`}
+                                        >
+                                          <option value="">None</option>
+                                          {routeGatewayCandidates(["exit_v4"]).map((n) => (
+                                            <option key={n.id} value={String(n.id)}>
+                                              {n.hostname}
+                                            </option>
+                                          ))}
+                                        </Select>
+                                        {routeGatewayCandidates(["exit_v4"]).length === 0 && (
+                                          <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
+                                            No other node on this network is set up as an exit node yet.
+                                          </p>
+                                        )}
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  <Accordion collapseAll className="border-t border-gray-200 dark:border-gray-700 pt-4">
+                                    <Accordion.Panel>
+                                      <Accordion.Title>Advanced</Accordion.Title>
+                                      <Accordion.Content className="space-y-4">
+                                        <div>
+                                          <p className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">
+                                            Logging (Nebula config)
+                                          </p>
+                                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                                      <div className="min-w-0">
+                                        <Label htmlFor="dd_log_level" value="Level" className="text-gray-500 dark:text-gray-400" />
+                                        <Select
+                                          id="dd_log_level"
+                                          value={deviceDetailsForm.log_level}
+                                          onChange={(e) =>
+                                            setDeviceDetailsForm((f) => ({ ...f, log_level: e.target.value }))
+                                          }
+                                          disabled={!deviceDetailsModal.isEditing}
+                                          className={`min-w-0 w-full ${!deviceDetailsModal.isEditing ? "bg-gray-50 dark:bg-gray-800 border-none cursor-default" : ""}`}
+                                        >
+                                          <option value="panic">panic</option>
+                                          <option value="fatal">fatal</option>
+                                          <option value="error">error</option>
+                                          <option value="warning">warning</option>
+                                          <option value="info">info</option>
+                                          <option value="debug">debug</option>
+                                        </Select>
+                                      </div>
+                                      <div className="min-w-0">
+                                        <Label htmlFor="dd_log_format" value="Format" className="text-gray-500 dark:text-gray-400" />
+                                        <Select
+                                          id="dd_log_format"
+                                          value={deviceDetailsForm.log_format}
+                                          onChange={(e) =>
+                                            setDeviceDetailsForm((f) => ({ ...f, log_format: e.target.value }))
+                                          }
+                                          disabled={!deviceDetailsModal.isEditing}
+                                          className={`min-w-0 w-full ${!deviceDetailsModal.isEditing ? "bg-gray-50 dark:bg-gray-800 border-none cursor-default" : ""}`}
+                                        >
+                                          <option value="text">text</option>
+                                          <option value="json">json</option>
+                                        </Select>
+                                      </div>
+                                      <div className="min-w-0 flex items-end pb-2">
+                                        <div className="flex items-center gap-2">
+                                          <Checkbox
+                                            id="dd_log_disable_timestamp"
+                                            checked={deviceDetailsForm.log_disable_timestamp}
+                                            onChange={(e) =>
+                                              setDeviceDetailsForm((f) => ({ ...f, log_disable_timestamp: e.target.checked }))
+                                            }
+                                            disabled={!deviceDetailsModal.isEditing}
+                                          />
+                                          <Label htmlFor="dd_log_disable_timestamp">Disable timestamp</Label>
+                                        </div>
+                                      </div>
+                                      <div className="min-w-0">
+                                        <Label htmlFor="dd_log_timestamp_format" value="Timestamp format (Go format, optional)" className="text-gray-500 dark:text-gray-400" />
+                                        <TextInput
+                                          id="dd_log_timestamp_format"
+                                          value={deviceDetailsForm.log_timestamp_format}
+                                          onChange={(e) =>
+                                            setDeviceDetailsForm((f) => ({ ...f, log_timestamp_format: e.target.value }))
+                                          }
+                                          placeholder="e.g. 2006-01-02T15:04:05.000Z07:00"
+                                          disabled={!deviceDetailsModal.isEditing}
+                                          className={`min-w-0 w-full ${!deviceDetailsModal.isEditing ? "bg-gray-50 dark:bg-gray-800 border-none cursor-default" : ""}`}
+                                        />
+                                      </div>
+                                    </div>
+                                    </div>
+
+                                    <div className="border-t border-gray-200 dark:border-gray-700 pt-4">
+                                      <p className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">
+                                        Punchy (NAT traversal)
+                                      </p>
+                                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                                        <div className="min-w-0 flex items-end pb-2">
+                                          <div className="flex items-center gap-2">
+                                            <Checkbox
+                                              id="dd_punchy_respond"
+                                              checked={deviceDetailsForm.punchy_respond}
+                                              onChange={(e) =>
+                                                setDeviceDetailsForm((f) => ({ ...f, punchy_respond: e.target.checked }))
+                                              }
+                                              disabled={!deviceDetailsModal.isEditing}
+                                            />
+                                            <Label htmlFor="dd_punchy_respond">Respond (punch back)</Label>
+                                          </div>
+                                        </div>
+                                        <div className="min-w-0">
+                                          <Label htmlFor="dd_punchy_delay" value="Delay (e.g. 1s)" className="text-gray-500 dark:text-gray-400" />
+                                          <TextInput
+                                            id="dd_punchy_delay"
+                                            value={deviceDetailsForm.punchy_delay}
+                                            onChange={(e) =>
+                                              setDeviceDetailsForm((f) => ({ ...f, punchy_delay: e.target.value }))
+                                            }
+                                            placeholder="1s"
+                                            disabled={!deviceDetailsModal.isEditing}
+                                            className={`min-w-0 w-full ${!deviceDetailsModal.isEditing ? "bg-gray-50 dark:bg-gray-800 border-none cursor-default" : ""}`}
+                                          />
+                                        </div>
+                                        <div className="min-w-0">
+                                          <Label htmlFor="dd_punchy_respond_delay" value="Respond delay (e.g. 5s)" className="text-gray-500 dark:text-gray-400" />
+                                          <TextInput
+                                            id="dd_punchy_respond_delay"
+                                            value={deviceDetailsForm.punchy_respond_delay}
+                                            onChange={(e) =>
+                                              setDeviceDetailsForm((f) => ({ ...f, punchy_respond_delay: e.target.value }))
+                                            }
+                                            placeholder="5s"
+                                            disabled={!deviceDetailsModal.isEditing}
+                                            className={`min-w-0 w-full ${!deviceDetailsModal.isEditing ? "bg-gray-50 dark:bg-gray-800 border-none cursor-default" : ""}`}
+                                          />
+                                        </div>
+                                      </div>
+                                    </div>
+
+                                    {deviceDetailsForm.platform === "desktop" && !deviceDetailsForm.is_lighthouse && (
+                                      <div className="border-t border-gray-200 dark:border-gray-700 pt-4 min-w-0">
+                                        {/* Same add-one / delete-each pattern as the "Other" routes list below. */}
+                                        <Label htmlFor="dd_advertise_addrs" value="Additional reachable addresses (IP:port)" className="text-gray-500 dark:text-gray-400" />
+                                        {deviceDetailsModal.isEditing && (
+                                          <p className="text-xs text-gray-500 dark:text-gray-400 mt-1 mb-2">{ADVERTISE_ADDRS_HELP}</p>
+                                        )}
+                                        {deviceDetailsForm.advertise_addrs.length === 0 && !deviceDetailsModal.isEditing && (
+                                          <p className="text-sm text-gray-400 dark:text-gray-500 mt-1">None</p>
+                                        )}
+                                        {deviceDetailsForm.advertise_addrs.map((addr) => (
+                                          <div key={addr} className="flex flex-wrap items-center gap-2 mt-2">
+                                            <span className="text-sm text-gray-700 dark:text-gray-300">{addr}</span>
+                                            {advertiseAddrWarning(addr) && (
+                                              <span className="text-xs text-yellow-600 dark:text-yellow-400">
+                                                {advertiseAddrWarning(addr)}
+                                              </span>
+                                            )}
+                                            {deviceDetailsModal.isEditing && (
+                                              <Button
+                                                type="button"
+                                                size="xs"
+                                                color="gray"
+                                                aria-label={`Remove ${addr}`}
+                                                onClick={() =>
+                                                  setDeviceDetailsForm((f) => ({
+                                                    ...f,
+                                                    advertise_addrs: f.advertise_addrs.filter((x) => x !== addr),
+                                                  }))
+                                                }
+                                              >
+                                                <HiTrash className="w-3 h-3" />
+                                              </Button>
+                                            )}
+                                          </div>
+                                        ))}
+                                        {deviceDetailsModal.isEditing && (
+                                          <div className="flex items-center gap-2 mt-2">
+                                            <TextInput
+                                              id="dd_advertise_addrs"
+                                              value={advertiseAddrInput}
+                                              onChange={(e) => {
+                                                setAdvertiseAddrInput(e.target.value);
+                                                setAdvertiseAddrError(null);
+                                              }}
+                                              placeholder="e.g. 203.0.113.7:4242"
+                                              className="min-w-0 flex-1"
+                                            />
+                                            <Button
+                                              type="button"
+                                              color="gray"
+                                              onClick={() => {
+                                                const addr = advertiseAddrInput.trim();
+                                                const shapeError = checkAdvertiseAddr(
+                                                  addr,
+                                                  networks.find((n) => n.id === deviceDetailsModal.node?.network_id)?.subnet_cidr
+                                                );
+                                                if (shapeError) {
+                                                  setAdvertiseAddrError(shapeError);
+                                                  return;
+                                                }
+                                                if (deviceDetailsForm.advertise_addrs.includes(addr)) {
+                                                  setAdvertiseAddrError("That address is already added");
+                                                  return;
+                                                }
+                                                if (deviceDetailsForm.advertise_addrs.length >= MAX_ADVERTISE_ADDRS) {
+                                                  setAdvertiseAddrError(`At most ${MAX_ADVERTISE_ADDRS} addresses per node`);
+                                                  return;
+                                                }
+                                                setDeviceDetailsForm((f) => ({ ...f, advertise_addrs: [...f.advertise_addrs, addr] }));
+                                                setAdvertiseAddrInput("");
+                                              }}
+                                            >
+                                              Add
+                                            </Button>
+                                          </div>
+                                        )}
+                                        {advertiseAddrError && (
+                                          <p className="text-sm text-red-600 dark:text-red-400 mt-1">{advertiseAddrError}</p>
+                                        )}
+                                      </div>
+                                    )}
+
+                                    {deviceDetailsForm.platform === "desktop" && (
+                                      <div className="border-t border-gray-200 dark:border-gray-700 pt-4 space-y-4">
+                                        <p className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">
+                                          Subnet Router & Exit Node Config
+                                        </p>
+                                        <p className="text-xs text-gray-500 dark:text-gray-400 -mt-2">
+                                          Configure what this node advertises to the network - the subnets it
+                                          routes to and/or whether it acts as an exit node. Routes are opt-in -
+                                          use "Used by" below each one to add the groups or individual hosts
+                                          that route through here (a group includes nodes added to it later). See{" "}
+                                          <a
+                                            href="https://nebulacommander.com/docs/usage/unsafe-routes/"
+                                            target="_blank"
+                                            rel="noreferrer"
+                                            className="underline hover:text-gray-700 dark:hover:text-gray-200"
+                                          >
+                                            the subnet router / exit node docs
+                                          </a>{" "}
+                                          for how this works, including hosts that don't run ncclient.
+                                        </p>
+                                        {deviceDetailsModal.node?.os_platform !== "linux" && (
+                                          <p className="text-sm text-amber-600 dark:text-amber-400">
+                                            {deviceDetailsModal.node?.os_platform
+                                              ? "This node isn't running ncclient on Linux, so this isn't applied automatically. IP forwarding and NAT must be configured manually on the node for it to take effect."
+                                              : "This node hasn't checked in yet, so we don't know its OS. Unless it's Linux running ncclient, IP forwarding and NAT must be configured manually for this to take effect."}
+                                          </p>
+                                        )}
+
+                                        {(deviceDetailsModal.node?.available_subnets ?? []).length > 0 && (
+                                          <div>
+                                            <p className="text-sm text-gray-500 dark:text-gray-400 mb-2">
+                                              Advertised subnets
+                                            </p>
+                                            <div className="space-y-3">
+                                              {(["ethernet", "wifi", "tailscale", "nebula"] as SubnetKind[]).map((kind) => {
+                                                const subnetsOfKind = (deviceDetailsModal.node?.available_subnets ?? []).filter(
+                                                  (s) => s.kind === kind
+                                                );
+                                                if (subnetsOfKind.length === 0) return null;
+                                                const kindLabel =
+                                                  kind === "ethernet"
+                                                    ? "Ethernet"
+                                                    : kind === "wifi"
+                                                    ? "Wi-Fi"
+                                                    : kind === "tailscale"
+                                                    ? "Tailscale"
+                                                    : "Nebula";
+                                                return (
+                                                  <div key={kind}>
+                                                    <p className="text-xs uppercase tracking-wide text-gray-400 dark:text-gray-500 mb-1">
+                                                      {kindLabel}
+                                                    </p>
+                                                    <div className="flex flex-col gap-2">
+                                                      {subnetsOfKind.map((s) => {
+                                                        const entry = deviceDetailsForm.unsafe_routes.find(
+                                                          (r) => r.source === "interface" && r.interface === s.interface
+                                                        );
+                                                        return (
+                                                          <div key={s.interface}>
+                                                            <div className="flex items-center gap-2">
+                                                              <Checkbox
+                                                                id={`dd_subnet_${s.interface}`}
+                                                                checked={!!entry}
+                                                                onChange={(e) => {
+                                                                  const enabled = e.target.checked;
+                                                                  setDeviceDetailsForm((f) => ({
+                                                                    ...f,
+                                                                    unsafe_routes: enabled
+                                                                      ? [
+                                                                          ...f.unsafe_routes.filter(
+                                                                            (r) => !(r.source === "interface" && r.interface === s.interface)
+                                                                          ),
+                                                                          { route: s.cidr, source: "interface", interface: s.interface, consumers: [] },
+                                                                        ]
+                                                                      : f.unsafe_routes.filter(
+                                                                          (r) => !(r.source === "interface" && r.interface === s.interface)
+                                                                        ),
+                                                                  }));
+                                                                }}
+                                                                disabled={!deviceDetailsModal.isEditing}
+                                                              />
+                                                              <Label htmlFor={`dd_subnet_${s.interface}`}>
+                                                                {s.interface} ({s.cidr})
+                                                              </Label>
+                                                            </div>
+                                                            {entry &&
+                                                              renderConsumerPicker(
+                                                                `subnet_${s.interface}`,
+                                                                entry,
+                                                                (consumers, consumer_groups) =>
+                                                                  setDeviceDetailsForm((f) => ({
+                                                                    ...f,
+                                                                    unsafe_routes: f.unsafe_routes.map((r) =>
+                                                                      r.source === "interface" && r.interface === s.interface
+                                                                        ? { ...r, consumers, consumer_groups }
+                                                                        : r
+                                                                    ),
+                                                                  }))
+                                                              )}
+                                                          </div>
+                                                        );
+                                                      })}
+                                                    </div>
+                                                  </div>
+                                                );
+                                              })}
+                                            </div>
+                                          </div>
+                                        )}
+
+                                        <div>
+                                          <p className="text-sm text-gray-500 dark:text-gray-400 mb-2">Other</p>
+                                          {deviceDetailsForm.unsafe_routes
+                                            .filter((r) => r.source === "manual")
+                                            .map((r) => (
+                                              <div key={r.route} className="mb-2">
+                                                <div className="flex items-center gap-2">
+                                                  <span className="text-sm text-gray-700 dark:text-gray-300">{r.route}</span>
+                                                  {deviceDetailsModal.isEditing && (
+                                                    <Button
+                                                      type="button"
+                                                      size="xs"
+                                                      color="gray"
+                                                      onClick={() =>
+                                                        setDeviceDetailsForm((f) => ({
+                                                          ...f,
+                                                          unsafe_routes: f.unsafe_routes.filter((x) => x.route !== r.route),
+                                                        }))
+                                                      }
+                                                    >
+                                                      <HiTrash className="w-3 h-3" />
+                                                    </Button>
+                                                  )}
+                                                </div>
+                                                {renderConsumerPicker(`manual_${r.route}`, r, (consumers, consumer_groups) =>
+                                                  setDeviceDetailsForm((f) => ({
+                                                    ...f,
+                                                    unsafe_routes: f.unsafe_routes.map((x) =>
+                                                      x.route === r.route ? { ...x, consumers, consumer_groups } : x
+                                                    ),
+                                                  }))
+                                                )}
+                                              </div>
+                                            ))}
+                                          {deviceDetailsModal.isEditing && (
+                                            <div className="flex items-center gap-2 mt-2">
+                                              <TextInput
+                                                value={otherRouteInput}
+                                                onChange={(e) => {
+                                                  setOtherRouteInput(e.target.value);
+                                                  setOtherRouteError(null);
+                                                }}
+                                                placeholder="e.g. 10.20.0.0/24"
+                                                className="min-w-0 flex-1"
+                                              />
+                                              <Button
+                                                type="button"
+                                                color="gray"
+                                                onClick={() => {
+                                                  const route = otherRouteInput.trim();
+                                                  if (!/^[0-9a-fA-F.:]+\/\d{1,3}$/.test(route)) {
+                                                    setOtherRouteError("Enter a CIDR, e.g. 10.20.0.0/24 or fd00::/64");
+                                                    return;
+                                                  }
+                                                  if (deviceDetailsForm.unsafe_routes.some((x) => x.route === route)) {
+                                                    setOtherRouteError("That route is already added");
+                                                    return;
+                                                  }
+                                                  setDeviceDetailsForm((f) => ({
+                                                    ...f,
+                                                    unsafe_routes: [...f.unsafe_routes, { route, source: "manual", consumers: [] }],
+                                                  }));
+                                                  setOtherRouteInput("");
+                                                }}
+                                              >
+                                                Add
+                                              </Button>
+                                            </div>
+                                          )}
+                                          {otherRouteError && (
+                                            <p className="text-sm text-red-600 dark:text-red-400 mt-1">{otherRouteError}</p>
+                                          )}
+                                        </div>
+                                      </div>
+                                    )}
+
+                                    {deviceDetailsForm.platform === "desktop" && (
+                                      <div className="border-t border-gray-200 dark:border-gray-700 pt-4">
+                                        <p className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">
+                                          Exit Node
+                                        </p>
+                                        <div>
+                                          <div className="flex items-center gap-2">
+                                            <Checkbox
+                                              id="dd_exit_node"
+                                              checked={deviceDetailsForm.unsafe_routes.some((r) => r.route === "0.0.0.0/0")}
+                                              onChange={(e) => {
+                                                const enabled = e.target.checked;
+                                                setDeviceDetailsForm((f) => ({
+                                                  ...f,
+                                                  unsafe_routes: enabled
+                                                    ? [
+                                                        ...f.unsafe_routes.filter((r) => r.route !== "0.0.0.0/0" && r.route !== "::/0"),
+                                                        { route: "0.0.0.0/0", source: "exit_v4", consumers: [] },
+                                                        { route: "::/0", source: "exit_v6", consumers: [] },
+                                                      ]
+                                                    : f.unsafe_routes.filter((r) => r.route !== "0.0.0.0/0" && r.route !== "::/0"),
+                                                }));
+                                              }}
+                                              disabled={!deviceDetailsModal.isEditing}
+                                            />
+                                            <Label htmlFor="dd_exit_node">Exit node (route all traffic)</Label>
+                                          </div>
+                                          {deviceDetailsForm.unsafe_routes.some((r) => r.route === "0.0.0.0/0") &&
+                                            renderConsumerPicker(
+                                              "exit",
+                                              deviceDetailsForm.unsafe_routes.find((r) => r.route === "0.0.0.0/0"),
+                                              (consumers, consumer_groups) =>
+                                                setDeviceDetailsForm((f) => ({
+                                                  ...f,
+                                                  unsafe_routes: f.unsafe_routes.map((r) =>
+                                                    r.route === "0.0.0.0/0" || r.route === "::/0"
+                                                      ? { ...r, consumers, consumer_groups }
+                                                      : r
+                                                  ),
+                                                }))
+                                            )}
+                                        </div>
+                                      </div>
+                                    )}
+                                      </Accordion.Content>
+                                    </Accordion.Panel>
+                                  </Accordion>
+
+                                  <div className="flex flex-wrap items-center justify-between gap-2 pt-4 border-t border-gray-200 dark:border-gray-700">
+                                    <div className="flex flex-wrap gap-2">
+                                      <Button type="button" color="gray" onClick={closeDeviceDetailsModal}>
+                                        Close
+                                      </Button>
+                                      {deviceDetailsModal.node && (
+                                        <Button
+                                          type="button"
+                                          color="gray"
+                                          onClick={() => handleDownloadConfig(deviceDetailsModal.node!)}
+                                        >
+                                          <HiDownload className="w-4 h-4 mr-1" />
+                                          Config
+                                        </Button>
+                                      )}
+                                      {!deviceDetailsModal.isEditing ? (
+                                        <Button
+                                          type="button"
+                                          color="gray"
+                                          onClick={() => setDeviceDetailsModal((s) => ({ ...s, isEditing: true }))}
+                                        >
+                                          <HiPencil className="w-4 h-4 mr-1" />
+                                          Edit
+                                        </Button>
+                                      ) : (
+                                        <Button
+                                          type="button"
+                                          color="gray"
+                                          onClick={() => {
+                                            const node = deviceDetailsModal.node;
+                                            if (node) {
+                                              setDeviceDetailsForm({
+                                                group: (node.groups && node.groups[0]) ?? "",
+                                                is_lighthouse: node.is_lighthouse,
+                                                is_relay: node.is_relay,
+                                                public_endpoint: node.public_endpoint ?? "",
+                                                advertise_addrs: node.advertise_addrs ?? [],
+                                                interval_seconds: String(node.lighthouse_options?.interval_seconds ?? 60),
+                                                log_level: node.logging_options?.level ?? "info",
+                                                log_format: node.logging_options?.format ?? "text",
+                                                log_disable_timestamp: node.logging_options?.disable_timestamp ?? false,
+                                                log_timestamp_format: node.logging_options?.timestamp_format ?? "",
+                                                punchy_respond: node.punchy_options?.respond ?? true,
+                                                punchy_delay: node.punchy_options?.delay ?? "",
+                                                punchy_respond_delay: node.punchy_options?.respond_delay ?? "",
+                                                platform: node.platform,
+                                                unsafe_routes: node.unsafe_routes ?? [],
+                                                subnet_router_id: findSubnetRouterId(node),
+                                                exit_node_id: findExitNodeId(node),
+                                              });
+                                              setOtherRouteInput("");
+                                              setOtherRouteError(null);
+                                              setAdvertiseAddrInput("");
+                                              setAdvertiseAddrError(null);
+                                              setDeviceDetailsModal((s) => ({ ...s, isEditing: false }));
+                                            }
+                                          }}
+                                        >
+                                          Cancel
+                                        </Button>
+                                      )}
+                                      {deviceDetailsModal.node && (
+                                        <>
+                                          {(() => {
+                                            const enrollState = getEnrollmentState(deviceDetailsModal.node);
+                                            return (
+                                              (enrollState.type === "enroll" || enrollState.type === "re-enroll") && (
+                                                <Button
+                                                  type="button"
+                                                  color="purple"
+                                                  onClick={() => { closeDeviceDetailsModal(); openEnrollmentCodeModal(deviceDetailsModal.node!); }}
+                                                >
+                                                  Get Enrollment Code
+                                                </Button>
+                                              )
+                                            );
+                                          })()}
+                                          <Button
+                                            type="button"
+                                            color="warning"
+                                            onClick={() => { closeDeviceDetailsModal(); openReEnrollModal(deviceDetailsModal.node!); }}
+                                          >
+                                            {deviceDetailsModal.node.platform !== "desktop" ? "Reissue Certificate" : "Re-Enroll"}
+                                          </Button>
+                                          {deviceDetailsModal.node.ip_address && (
+                                            <Button
+                                              type="button"
+                                              color="failure"
+                                              onClick={() => { closeDeviceDetailsModal(); openRevokeModal(deviceDetailsModal.node!); }}
+                                            >
+                                              Revoke Certificate
+                                            </Button>
+                                          )}
+                                          <Button
+                                            type="button"
+                                            color="failure"
+                                            onClick={() => { closeDeviceDetailsModal(); openDeleteModal(deviceDetailsModal.node!); }}
+                                          >
+                                            <HiTrash className="w-4 h-4 mr-1" />
+                                            Delete
+                                          </Button>
+                                        </>
+                                      )}
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                      {deviceDetailsModal.isEditing && hasDeviceDetailsFormChanges() && (
+                                        deviceDetailsModal.showSaved ? (
+                                          <span
+                                            className={`inline-flex items-center gap-1 text-green-600 dark:text-green-400 text-sm font-medium transition-opacity duration-500 ease-in-out ${
+                                              deviceDetailsModal.savedFading ? "opacity-0" : "opacity-100"
+                                            }`}
+                                          >
+                                            <HiCheckCircle className="w-5 h-5" />
+                                            {deviceDetailsModal.certResigned ? "Saved (certificate reissued)" : "Saved"}
+                                          </span>
+                                        ) : (
+                                          <Button
+                                            type="submit"
+                                            color="purple"
+                                            isProcessing={saving}
+                                            disabled={saving}
+                                          >
+                                            Save
+                                          </Button>
+                                        )
+                                      )}
+                                    </div>
+                                  </div>
+                                </>
+                              )}
+                            </form>
+                          </div>
+        </Modal.Body>
+      </Modal>
+
+      <Modal show={reEnrollModal.open} onClose={closeReEnrollModal} size="md">
+        <Modal.Header>
+          {reEnrollModal.node?.platform !== "desktop" ? "Reissue Certificate" : "Re-Enroll Device"}
+        </Modal.Header>
+        <Modal.Body>
+          <p className="text-gray-700 dark:text-gray-300">
+            This will generate a new certificate for this device. The current certificate will be
+            revoked and the old config/certificate will no longer function. Do you want to continue?
+          </p>
+        </Modal.Body>
+        <Modal.Footer>
+          <Button color="gray" onClick={closeReEnrollModal}>
+            Cancel
+          </Button>
+          <Button
+            color="warning"
+            onClick={handleReEnrollConfirm}
+            isProcessing={reEnrollModal.processing}
+            disabled={reEnrollModal.processing}
+          >
+            {reEnrollModal.node?.platform !== "desktop" ? "Reissue Certificate" : "Re-Enroll"}
+          </Button>
+        </Modal.Footer>
+      </Modal>
+
+      <Modal show={revokeModal.open} onClose={closeRevokeModal} size="md">
+        <Modal.Header>Revoke Certificate</Modal.Header>
+        <Modal.Body>
+          {revokeModal.step === 1 && revokeModal.node && (
+            <p className="text-gray-700 dark:text-gray-300">
+              This will revoke the node&apos;s certificate and take it offline. The node will no
+              longer be able to connect to the network. You can re-enroll it later to issue a new
+              certificate. Do you want to continue?
+            </p>
+          )}
+          {revokeModal.step === 2 && revokeModal.node && (
+            <div className="space-y-4">
+              <p className="text-gray-700 dark:text-gray-300">
+                To confirm, type the node hostname: <strong>{revokeModal.node.hostname}</strong>
+              </p>
+              <TextInput
+                type="text"
+                value={revokeModal.typedHostname}
+                onChange={(e) =>
+                  setRevokeModal((s) => ({ ...s, typedHostname: e.target.value }))
+                }
+                placeholder={revokeModal.node.hostname}
+              />
+            </div>
+          )}
+        </Modal.Body>
+        <Modal.Footer>
+          {revokeModal.step === 1 ? (
+            <>
+              <Button color="gray" onClick={closeRevokeModal}>
+                Cancel
+              </Button>
+              <Button
+                color="failure"
+                onClick={() => setRevokeModal((s) => ({ ...s, step: 2 }))}
+              >
+                Continue
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button
+                color="gray"
+                onClick={() => setRevokeModal((s) => ({ ...s, step: 1, typedHostname: "" }))}
+              >
+                Back
+              </Button>
+              <Button
+                color="failure"
+                onClick={handleRevokeConfirm}
+                disabled={
+                  revokeModal.node?.hostname.trim() !== revokeModal.typedHostname.trim() ||
+                  revokeModal.processing
+                }
+                isProcessing={revokeModal.processing}
+              >
+                Revoke
+              </Button>
+            </>
+          )}
+        </Modal.Footer>
+      </Modal>
+
+      <Modal show={deleteModal.open} onClose={closeDeleteModal} size="md">
+        <Modal.Header>Delete node</Modal.Header>
+        <Modal.Body>
+          {deleteModal.step === 1 && deleteModal.node && (
+            <div className="space-y-4">
+              <p className="text-gray-700 dark:text-gray-300">
+                Are you sure you want to delete the node <strong>{deleteModal.node.hostname}</strong>? This will remove the node, its certificate, enrollment codes, and release its IP. This cannot be undone.
+              </p>
+              {isOnlyLighthouseInNetwork(deleteModal.node) && (
+                <Alert color="failure">
+                  Cannot delete the only lighthouse. Designate another node as lighthouse first, or delete the network.
+                </Alert>
+              )}
+            </div>
+          )}
+          {deleteModal.step === 2 && deleteModal.node && (
+            <div className="space-y-4">
+              <p className="text-gray-700 dark:text-gray-300">
+                To confirm, type the node hostname: <strong>{deleteModal.node.hostname}</strong>
+              </p>
+              <TextInput
+                type="text"
+                value={deleteModal.typedHostname}
+                onChange={(e) =>
+                  setDeleteModal((s) => ({ ...s, typedHostname: e.target.value }))
+                }
+                placeholder={deleteModal.node.hostname}
+              />
+            </div>
+          )}
+        </Modal.Body>
+        <Modal.Footer>
+          {deleteModal.step === 1 ? (
+            <>
+              <Button color="gray" onClick={closeDeleteModal}>
+                Cancel
+              </Button>
+              <Button
+                color="failure"
+                onClick={() => setDeleteModal((s) => ({ ...s, step: 2 }))}
+                disabled={deleteModal.node ? isOnlyLighthouseInNetwork(deleteModal.node) : false}
+              >
+                Continue
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button
+                color="gray"
+                onClick={() => setDeleteModal((s) => ({ ...s, step: 1, typedHostname: "" }))}
+              >
+                Back
+              </Button>
+              <Button
+                color="failure"
+                onClick={handleDeleteConfirm}
+                disabled={
+                  deleteModal.node?.hostname.trim() !== deleteModal.typedHostname.trim() || deleting
+                }
+                isProcessing={deleting}
+              >
+                Delete
+              </Button>
+            </>
+          )}
+        </Modal.Footer>
+      </Modal>
+
+    </div>
+  );
+}

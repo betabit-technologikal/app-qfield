@@ -1,0 +1,247 @@
+/**
+ * Sidebar navigation with Flowbite - Mobile responsive with hamburger menu
+ */
+import { useState } from 'react';
+import { Sidebar as FlowbiteSidebar } from 'flowbite-react';
+import { Link, useLocation } from 'react-router-dom';
+import {
+  HiHome,
+  HiServer,
+  HiLogout,
+  HiGlobe,
+  HiDownload,
+  HiUserGroup,
+  HiUsers,
+  HiMail,
+  HiClipboardList,
+  HiInformationCircle,
+  HiColorSwatch,
+  HiArchive,
+} from 'react-icons/hi';
+import { FaGithub, FaComments } from 'react-icons/fa';
+import { AboutModal } from '../AboutModal';
+import { usePermissions } from '../../contexts/PermissionContext';
+import { useVersionCheck } from '../../hooks/useVersionCheck';
+
+interface SidebarProps {
+  onLogout: () => void;
+  isOpen: boolean;
+  onClose: () => void;
+}
+
+export function Sidebar({ onLogout, isOpen, onClose }: SidebarProps) {
+  const [showAboutModal, setShowAboutModal] = useState(false);
+  const location = useLocation();
+  const { isSystemAdmin, isNetworkOwner } = usePermissions();
+  const versionCheck = useVersionCheck();
+
+  const handleItemClick = () => {
+    if (window.innerWidth < 1650) {
+      onClose();
+    }
+  };
+
+  return (
+    <>
+      {/* Overlay - visible below 1650px */}
+      {isOpen && (
+        <div
+          className="fixed inset-0 bg-black bg-opacity-50 z-40 xl-custom:hidden"
+          onClick={onClose}
+        />
+      )}
+
+      {/* Sidebar */}
+      <div
+        className={`
+          fixed xl-custom:static inset-y-0 left-0 z-50
+          transform transition-transform duration-300 ease-in-out
+          xl-custom:transform-none
+          ${isOpen ? 'translate-x-0' : '-translate-x-full xl-custom:translate-x-0'}
+        `}
+      >
+        <FlowbiteSidebar aria-label="Sidebar with navigation" className="h-full">
+          <FlowbiteSidebar.Items>
+            <FlowbiteSidebar.ItemGroup>
+              <FlowbiteSidebar.Item
+                as={Link}
+                to="/"
+                icon={HiHome}
+                active={location.pathname === '/'}
+                onClick={handleItemClick}
+              >
+                Home
+              </FlowbiteSidebar.Item>
+
+              <FlowbiteSidebar.Item
+                as={Link}
+                to="/networks"
+                icon={HiGlobe}
+                active={location.pathname === '/networks'}
+                onClick={handleItemClick}
+                data-onboarding-target="sidebar-networks"
+              >
+                Networks
+              </FlowbiteSidebar.Item>
+
+              <FlowbiteSidebar.Item
+                as={Link}
+                to="/groups"
+                icon={HiUserGroup}
+                active={location.pathname === '/groups'}
+                onClick={handleItemClick}
+              >
+                Groups
+              </FlowbiteSidebar.Item>
+
+              <FlowbiteSidebar.Item
+                as={Link}
+                to="/dns"
+                icon={HiGlobe}
+                active={location.pathname === '/dns'}
+                onClick={handleItemClick}
+              >
+                DNS
+              </FlowbiteSidebar.Item>
+
+              <FlowbiteSidebar.Item
+                as={Link}
+                to="/nodes"
+                icon={HiServer}
+                active={location.pathname === '/nodes'}
+                onClick={handleItemClick}
+                data-onboarding-target="sidebar-nodes"
+              >
+                Nodes
+              </FlowbiteSidebar.Item>
+
+              <FlowbiteSidebar.Item
+                as={Link}
+                to="/client-download"
+                icon={HiDownload}
+                active={location.pathname === '/client-download'}
+                onClick={handleItemClick}
+                data-onboarding-target="sidebar-client-download"
+              >
+                Client Download
+              </FlowbiteSidebar.Item>
+
+              <FlowbiteSidebar.Item
+                as={Link}
+                to="/settings/appearance"
+                icon={HiColorSwatch}
+                active={location.pathname === '/settings/appearance'}
+                onClick={handleItemClick}
+              >
+                Appearance
+              </FlowbiteSidebar.Item>
+
+              <FlowbiteSidebar.Item
+                href="https://nebulacommander.com/docs/"
+                target="_blank"
+                rel="noreferrer"
+                icon={HiGlobe}
+                as="a"
+              >
+                Documentation
+              </FlowbiteSidebar.Item>
+
+              {/* System Admin Only */}
+              {isSystemAdmin && (
+                <>
+                  <FlowbiteSidebar.Item
+                    as={Link}
+                    to="/users"
+                    icon={HiUsers}
+                    active={location.pathname === '/users'}
+                    onClick={handleItemClick}
+                  >
+                    Users
+                  </FlowbiteSidebar.Item>
+                  <FlowbiteSidebar.Item
+                    as={Link}
+                    to="/audit"
+                    icon={HiClipboardList}
+                    active={location.pathname === '/audit'}
+                    onClick={handleItemClick}
+                  >
+                    Audit
+                  </FlowbiteSidebar.Item>
+                  <FlowbiteSidebar.Item
+                    as={Link}
+                    to="/settings/backup"
+                    icon={HiArchive}
+                    active={location.pathname === '/settings/backup'}
+                    onClick={handleItemClick}
+                  >
+                    Backup &amp; export
+                  </FlowbiteSidebar.Item>
+                </>
+              )}
+
+              {/* Network Owners and System Admins */}
+              {(isNetworkOwner || isSystemAdmin) && (
+                <FlowbiteSidebar.Item
+                  as={Link}
+                  to="/invitations"
+                  icon={HiMail}
+                  active={location.pathname === '/invitations'}
+                  onClick={handleItemClick}
+                >
+                  Invitations
+                </FlowbiteSidebar.Item>
+              )}
+            </FlowbiteSidebar.ItemGroup>
+
+            <FlowbiteSidebar.ItemGroup>
+              <FlowbiteSidebar.Item
+                icon={HiLogout}
+                style={{ cursor: 'pointer' }}
+                onClick={() => {
+                  handleItemClick();
+                  onLogout();
+                }}
+              >
+                Logout
+              </FlowbiteSidebar.Item>
+              <FlowbiteSidebar.Item
+                href="https://matrix.to/#/#nebula-commander:matrix.org"
+                target="_blank"
+                rel="noopener noreferrer"
+                icon={FaComments}
+                as="a"
+              >
+                Matrix Space
+              </FlowbiteSidebar.Item>
+              <FlowbiteSidebar.Item
+                href="https://github.com/NixRTR/nebula-commander"
+                target="_blank"
+                rel="noopener noreferrer"
+                icon={FaGithub}
+                as="a"
+              >
+                GitHub
+              </FlowbiteSidebar.Item>
+              <div className="relative">
+                {versionCheck?.update_available && (
+                  <span
+                    className="absolute left-3 top-1 z-10 block h-2 w-2 rounded-full bg-red-500 ring-2 ring-white dark:ring-gray-800"
+                    title={`Update available: v${versionCheck.latest_version}`}
+                  />
+                )}
+                <FlowbiteSidebar.Item
+                  icon={HiInformationCircle}
+                  style={{ cursor: 'pointer' }}
+                  onClick={() => setShowAboutModal(true)}
+                >
+                  About
+                </FlowbiteSidebar.Item>
+              </div>
+            </FlowbiteSidebar.ItemGroup>
+          </FlowbiteSidebar.Items>
+        </FlowbiteSidebar>
+      </div>
+      <AboutModal show={showAboutModal} onClose={() => setShowAboutModal(false)} versionCheck={versionCheck} />
+    </>
+  );
+}

@@ -1,0 +1,136 @@
+# =============================================================================
+# Nebula Commander - Git Ignore
+# =============================================================================
+notes
+notes/*
+bandit-report.json
+# flatpak-builder's own scratch dirs (packaging/flatpak/) - not "build/"/
+# "dist/" named, so not caught by the generic Python rules below.
+packaging/flatpak/.flatpak-builder/
+packaging/flatpak/build-dir/
+packaging/flatpak/repo/
+*.flatpak
+# Throwaway D-Bus/jeepney API verification scripts (repo root, not packaging/) - not meant to be committed.
+/.spike/
+# =============================================================================
+# Python
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+# ...but not the service package's staged /usr/lib payload (systemd unit, run wrapper, tmpfiles.d)
+!packaging/deb/service/payload/usr/lib/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.python-version
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# =============================================================================
+# Node.js / Frontend
+# =============================================================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn
+
+# Build output
+frontend/dist/
+
+# =============================================================================
+# IDE and Editors
+# =============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# =============================================================================
+# OS Files
+# =============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# =============================================================================
+# Nix
+# =============================================================================
+result
+result-*
+.direnv/
+
+# =============================================================================
+# Docker
+# =============================================================================
+docker/.env
+docker/env.d/
+
+# =============================================================================
+# Secrets and Certificates
+# =============================================================================
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+certs/
+
+# =============================================================================
+# Database
+# =============================================================================
+*.sqlite
+*.sqlite3
+*.db
+
+# =============================================================================
+# Local Configuration
+# =============================================================================
+.env
+.env.local
+.env.*.local
+*.local
+
+# =============================================================================
+# Logs
+# =============================================================================
+*.log
+logs/
+
+# Release version stamped by client/stamp_version.py at build time
+client/_build_version.py

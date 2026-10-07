@@ -1,0 +1,285 @@
+"""
+Wrapper for nebula-cert CLI. Runs nebula-cert subprocess for CA and cert operations.
+
+Security: Uses subprocess with shell=False and validated arguments.
+Command path is resolved at runtime but not user-controllable.
+"""
+import ipaddress
+import logging
+import re
+import shutil
+import subprocess  # nosec B404 - used with shell=False and validated args
+from pathlib import Path
+from typing import List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+def _check_path_under_roots(path: Path, allowed_roots: List[Path]) -> Path:
+    """
+    Ensure the path, when resolved, lies under one of the allowed roots.
+    Returns the resolved path for use in file operations. Raises ValueError if not under any root.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError as e:
+        raise ValueError(f"Cannot resolve path {path}: {e}") from e
+    if not allowed_roots:
+        return resolved
+    for root in allowed_roots:
+        try:
+            root_resolved = root.resolve()
+        except OSError:
+            continue
+        try:
+            resolved.relative_to(root_resolved)
+        except ValueError:
+            continue
+        return resolved
+    raise ValueError(f"Path {path} is not under any allowed root")
+
+
+def nebula_cert_path() -> Optional[str]:
+    """Return path to nebula-cert binary, or None if not found."""
+    return shutil.which("nebula-cert")
+
+
+# Allow only a conservative character set for arguments (hostnames, paths, identifiers).
+# Comma is included for nebula-cert's list-valued flags (-groups, -subnets), which take
+# a comma-separated list in a single argument - harmless with shell=False.
+# CodeQL: we pass the result of _to_safe_arg() to subprocess, not raw user input.
+_SAFE_ARG_PATTERN = re.compile(r"^[a-zA-Z0-9_\-.:/,]*$")
+_ALLOWED_ARG_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.:/,"
+)
+
+
+def _validate_arg(arg: str) -> None:
+    """
+    Validate subprocess argument for safety.
+
+    While shell=False protects us from shell injection, this provides
+    defense in depth by rejecting arguments with suspicious characters
+    and enforcing a conservative allowlist for argument contents.
+    """
+    # Check for shell metacharacters that should never appear in nebula-cert args
+    dangerous_chars = ['|', '&', ';', '`', '$', '(', ')', '<', '>', '\n', '\r']
+    arg_str = str(arg)
+
+    for char in dangerous_chars:
+        if char in arg_str:
+            raise ValueError(f"Invalid character '{char}' in argument: {arg_str[:50]}")
+
+    # Additional check: reject null bytes
+    if '\x00' in arg_str:
+        raise ValueError(f"Null byte in argument: {arg_str[:50]}")
+
+    # Enforce a reasonable maximum length to avoid abuse
+    if len(arg_str) > 256:
+        raise ValueError(f"Argument too long (>{256} chars): {arg_str[:50]}")
+
+    # Allow only a conservative character set in arguments derived from user input.
+    # This includes alphanumerics and a few safe punctuation characters commonly used
+    # in hostnames, file paths, and identifiers.
+    if not _SAFE_ARG_PATTERN.match(arg_str):
+        raise ValueError(f"Argument contains disallowed characters: {arg_str[:50]}")
+
+
+def _to_safe_arg(arg: str) -> str:
+    """
+    Validate argument and return a new string built only from allowlisted characters.
+    The returned value is safe to pass to subprocess (no raw user input is passed through).
+    """
+    _validate_arg(arg)
+    # Reconstruct from allowlist so the value passed to subprocess is not the raw input
+    return "".join(c for c in str(arg) if c in _ALLOWED_ARG_CHARS)
+
+
+def _path_arg(path: Path) -> str:
+    """A filesystem path as a nebula-cert argument, always with forward slashes.
+
+    _SAFE_ARG_PATTERN deliberately has no backslash, so str(path) - which uses
+    backslash separators on Windows - was rejected there, breaking CA/cert
+    generation on Windows dev machines. as_posix() is identical to str() on
+    Linux (the production target) and gives C:/... on Windows, which both the
+    allowlist and nebula-cert accept.
+    """
+    return Path(path).as_posix()
+
+
+def run_nebula_cert(args: list[str], cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
+    """
+    Run nebula-cert with given args. Raises CalledProcessError on failure; stderr is logged.
+    
+    Security: Validates all arguments before execution to prevent injection attacks.
+    """
+    cmd = nebula_cert_path()
+    if not cmd:
+        raise FileNotFoundError("nebula-cert not found in PATH")
+    
+    # Pass only allowlist-derived strings to subprocess (no raw user input)
+    safe_args = [_to_safe_arg(a) for a in args]
+    try:
+        # lgtm [py/command-line-injection] Arguments are allowlist-sanitized by _to_safe_arg() before use.
+        return subprocess.run(  # nosec B603 - command path validated, shell=False, args from _to_safe_arg
+            [cmd] + safe_args,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+    except subprocess.CalledProcessError as e:
+        if e.stderr:
+            logger.error("nebula-cert stderr: %s", e.stderr.strip())
+        raise
+
+
+def keygen(
+    out_pub: Path,
+    out_key: Path,
+    allowed_roots: Optional[List[Path]] = None,
+) -> None:
+    """Generate a Nebula host keypair. Creates out_pub and out_key."""
+    if allowed_roots is not None:
+        _check_path_under_roots(out_pub, allowed_roots)
+        _check_path_under_roots(out_key, allowed_roots)
+    # lgtm [py/path-injection] Paths validated to be under allowed_roots above.
+    out_pub.parent.mkdir(parents=True, exist_ok=True)
+    out_key.parent.mkdir(parents=True, exist_ok=True)
+    run_nebula_cert([
+        "keygen",
+        "-out-pub", _path_arg(out_pub),
+        "-out-key", _path_arg(out_key),
+    ])
+    logger.info("Generated keypair: %s, %s", out_pub, out_key)
+
+
+_ALLOWED_CURVES = {"25519", "P256"}
+
+
+def ca_generate(
+    name: str,
+    out_crt: Path,
+    out_key: Path,
+    duration_hours: int = 8760 * 2,  # 2 years
+    version: int = 2,
+    curve: str = "25519",
+    allowed_roots: Optional[List[Path]] = None,
+) -> None:
+    """Generate a new Nebula CA. Creates out_crt and out_key.
+
+    version/curve are passed explicitly rather than relying on nebula-cert's own
+    default (which is version-dependent and has changed upstream before) - see
+    https://github.com/slackhq/nebula/pull/1216. A host cert signed against this CA
+    with `sign` automatically inherits both version and curve from the CA; nothing
+    needs to be passed at sign time.
+    """
+    if curve not in _ALLOWED_CURVES:
+        raise ValueError(f"Unsupported curve: {curve!r} (expected one of {_ALLOWED_CURVES})")
+    if allowed_roots is not None:
+        _check_path_under_roots(out_crt, allowed_roots)
+        _check_path_under_roots(out_key, allowed_roots)
+    # lgtm [py/path-injection] Paths validated to be under allowed_roots above.
+    out_crt.parent.mkdir(parents=True, exist_ok=True)
+    out_key.parent.mkdir(parents=True, exist_ok=True)
+    run_nebula_cert([
+        "ca",
+        "-name", name,
+        "-out-crt", _path_arg(out_crt),
+        "-out-key", _path_arg(out_key),
+        "-duration", f"{duration_hours}h",
+        "-version", str(version),
+        "-curve", curve,
+    ])
+    logger.info("Generated CA: %s (version=%s, curve=%s)", out_crt, version, curve)
+
+
+def cert_sign(
+    ca_crt: Path,
+    ca_key: Path,
+    name: str,
+    ip: str,
+    out_crt: Path,
+    groups: Optional[list[str]] = None,
+    duration_hours: int = 8760,  # 1 year
+    in_pub: Optional[Path] = None,
+    subnet_cidr: Optional[str] = None,
+    unsafe_subnets: Optional[list[str]] = None,
+    allowed_roots: Optional[List[Path]] = None,
+) -> None:
+    """
+    Sign a host certificate. If in_pub is set, sign the given public key (betterkeys).
+    Otherwise nebula-cert will generate a keypair and we only get the cert (not recommended).
+    -ip is passed as CIDR. Use subnet_cidr (e.g. 10.100.0.0/24) so the cert uses the network's
+    prefix length; that gives hosts "vpnNetworks in common" and allows layer-3 traffic between them.
+
+    unsafe_subnets: CIDRs this node is allowed to route for as a subnet-router/exit-node
+    gateway (Nebula's tun.unsafe_routes on *other* nodes points its `via` at this node only
+    for CIDRs listed here - Nebula silently refuses to route a subnet the via node's own
+    cert doesn't claim). Passed via the deprecated `-subnets` flag (alias for
+    `-unsafe-networks`), matching this file's existing use of `-ip` over `-networks`.
+    """
+    if allowed_roots is not None:
+        _check_path_under_roots(ca_crt, allowed_roots)
+        _check_path_under_roots(ca_key, allowed_roots)
+        _check_path_under_roots(out_crt, allowed_roots)
+        if in_pub is not None:
+            _check_path_under_roots(in_pub, allowed_roots)
+    # lgtm [py/path-injection] Paths validated to be under allowed_roots above.
+    out_crt.parent.mkdir(parents=True, exist_ok=True)
+    # Strip any existing /suffix from ip so we control the prefix
+    ip_base = ip.split("/")[0].strip()
+    if subnet_cidr:
+        net = ipaddress.ip_network(subnet_cidr.strip(), strict=False)
+        ip_cidr = f"{ip_base}/{net.prefixlen}"
+    else:
+        ip_cidr = ip if "/" in ip else f"{ip_base}/32"
+    args = [
+        "sign",
+        "-ca-crt", _path_arg(ca_crt),
+        "-ca-key", _path_arg(ca_key),
+        "-name", name,
+        "-ip", ip_cidr,
+        "-out-crt", _path_arg(out_crt),
+        "-duration", f"{duration_hours}h",
+    ]
+    if groups:
+        args.extend(["-groups", ",".join(groups)])
+    if unsafe_subnets:
+        args.extend(["-subnets", ",".join(unsafe_subnets)])
+    if in_pub is not None:
+        args.extend(["-in-pub", _path_arg(in_pub)])
+    run_nebula_cert(args)
+    logger.info("Signed certificate for %s at %s", name, out_crt)
+
+
+def cert_info(cert_pem: str) -> tuple[str, "datetime"]:
+    """(fingerprint, not_after) of a certificate, via `nebula-cert print -json`.
+
+    The fingerprint is exactly what Nebula's pki.blocklist matches on, for v1 and v2
+    certificates alike. not_after is returned as a naive UTC datetime (the convention
+    used by the models). Raises ValueError if the PEM can't be parsed.
+    """
+    import json
+    import tempfile
+    from datetime import datetime, timezone
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "host.crt"
+        path.write_text(cert_pem)
+        try:
+            result = run_nebula_cert(["print", "-json", "-path", _path_arg(path)])
+        except subprocess.CalledProcessError as e:
+            raise ValueError(f"nebula-cert could not parse certificate: {e.stderr or e}") from e
+    data = json.loads(result.stdout)
+    if isinstance(data, list):  # a PEM bundle prints as a list; host certs hold one cert
+        if not data:
+            raise ValueError("nebula-cert printed no certificate")
+        data = data[0]
+    fingerprint = str(data.get("fingerprint") or "").strip()
+    not_after_raw = str((data.get("details") or {}).get("notAfter") or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint) or not not_after_raw:
+        raise ValueError("nebula-cert output is missing fingerprint/notAfter")
+    not_after = datetime.fromisoformat(not_after_raw.replace("Z", "+00:00"))
+    return fingerprint, not_after.astimezone(timezone.utc).replace(tzinfo=None)

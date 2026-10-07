@@ -1,0 +1,176 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <?ifndef Version?>
+  <?define Version = "0.0.0" ?>
+  <?endif?>
+  <Package Name="Nebula Commander"
+           Manufacturer="NixRTR"
+           Version="$(var.Version)"
+           UpgradeCode="A7B8C9D0-E1F2-4A5B-8C9D-0E1F2A3B4C5D"
+           Language="1033"
+           Codepage="1252"
+           InstallerVersion="500"
+           Compressed="yes"
+           Scope="perMachine">
+    <SummaryInformation Codepage="1252" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Nebula Commander is already installed." />
+    <Media Id="1" Cabinet="NebulaCommander.cab" EmbedCab="yes" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/NixRTR/nebula-commander" />
+    <Property Id="ARPPRODUCTICON" Value="NcclientExe" />
+    <Icon Id="NcclientExe" SourceFile="redist\ncclient.exe" />
+
+    <!-- Launch the windowed app from the finish dialog's optional checkbox -
+         it's the only GUI client now. -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch Nebula Commander now" />
+    <Property Id="WixShellExecTarget" Value="[#NebulaCommanderAppExe]" />
+    <CustomAction Id="LaunchApplication" DllEntry="WixShellExec" Impersonate="yes" BinaryRef="Wix4UtilCA_X86" />
+
+    <!-- WixUI_Minimal shows a license page by default; without this it falls back to
+         WiX's own placeholder sample text instead of ncclient's actual GPLv3 license. -->
+    <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
+
+    <ui:WixUI Id="WixUI_Minimal" />
+    <UI>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication" Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT AND NOT Installed" />
+    </UI>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLDIR" Name="Nebula Commander" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ProgramMenuDir" Name="Nebula Commander" />
+    </StandardDirectory>
+
+    <!-- %ProgramData%\nebula-commander - the service's state (settings.json, the
+         DPAPI-encrypted device token, status.json, the service-managed Nebula install,
+         and Nebula's own config.yaml (which holds the node's private key)/
+         dns-client.json/nebula.log). SYSTEM/Administrators-only: the app reads and
+         changes it exclusively through the service's named pipe. See
+         client/windows/shared_paths.py and harden.py. -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="SHAREDDATADIR" Name="nebula-commander" />
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Nebula Commander" Level="1" ConfigurableDirectory="INSTALLDIR">
+      <ComponentGroupRef Id="MainComponents" />
+      <ComponentRef Id="SharedDataFolderPermissions" />
+    </Feature>
+
+    <Feature Id="AddToPath"
+             Title="Add install directory to PATH"
+             Description="Allows running ncclient from any command prompt."
+             Level="2">
+      <ComponentRef Id="PathEnvironment" />
+    </Feature>
+
+    <ComponentGroup Id="MainComponents" Directory="INSTALLDIR">
+      <Component Id="NcclientExe" Guid="B1C2D3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E">
+        <File Id="NcclientExe"
+              Source="redist\ncclient.exe"
+              KeyPath="yes">
+          <Shortcut Id="NcclientStartMenuShortcut"
+                    Name="Nebula Commander (CLI)"
+                    Description="Nebula Commander command-line client"
+                    Directory="ProgramMenuDir"
+                    WorkingDirectory="INSTALLDIR" />
+        </File>
+      </Component>
+      <!-- The windowed WinUI 3 app (client/windows-app/) - side-tab Status/
+           Enrollment/Settings UI, minimizes to tray on close. Self-contained
+           single-file publish, so just one file to ship, same as the exes
+           above. Talks to NcclientServiceExe only over the named pipe
+           NcclientServiceExe exposes (client/windows/pipe_server.py); changes
+           require running it as administrator. -->
+      <Component Id="NebulaCommanderAppExe" Guid="02804C73-586C-4ACC-BF1B-7235A2CF233C">
+        <File Id="NebulaCommanderAppExe"
+              Source="redist\NebulaCommanderApp.exe"
+              KeyPath="yes">
+          <Shortcut Id="AppStartMenuShortcut"
+                    Name="Nebula Commander"
+                    Description="Nebula Commander"
+                    Directory="ProgramMenuDir"
+                    WorkingDirectory="INSTALLDIR" />
+        </File>
+      </Component>
+      <!-- The service that actually polls Nebula Commander and runs Nebula, as
+           LocalSystem (already fully privileged - no UAC prompt needed). Installed/
+           started on install, stopped on upgrade/uninstall, removed on uninstall. -->
+      <Component Id="NcclientServiceExe" Guid="E4F5A6B7-C8D9-4E0F-1A2B-3C4D5E6F7A8B">
+        <File Id="NcclientServiceExe"
+              Source="redist\ncclient-service.exe"
+              KeyPath="yes" />
+        <ServiceInstall Id="NebulaCommanderServiceInstall"
+                         Type="ownProcess"
+                         Name="NebulaCommanderService"
+                         DisplayName="Nebula Commander"
+                         Description="Polls Nebula Commander for config/certs and runs the Nebula mesh VPN daemon."
+                         Start="auto"
+                         Account="LocalSystem"
+                         ErrorControl="normal" />
+        <ServiceControl Id="NebulaCommanderServiceControl"
+                         Name="NebulaCommanderService"
+                         Start="install"
+                         Stop="both"
+                         Remove="uninstall"
+                         Wait="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Create %ProgramData%\nebula-commander SYSTEM/Administrators-only, with a
+         protected DACL (P) so ProgramData's default "Users may create files" ACE is
+         not inherited. Versions before this granted Users full control here, which
+         let any local user replace the nebula.exe the LocalSystem service runs and
+         read the node's private key; the service itself re-applies this ACL to the
+         whole tree on every start (client/windows/harden.py), which is what fixes
+         upgraded installs regardless of how MSI propagates this one. -->
+    <DirectoryRef Id="SHAREDDATADIR">
+      <Component Id="SharedDataFolderPermissions" Guid="F5A6B7C8-D9E0-4F1A-2B3C-4D5E6F7A8B9C">
+        <CreateFolder>
+          <PermissionEx Sddl="O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+        </CreateFolder>
+        <RemoveFolder Id="RemoveSharedDataFolder" On="uninstall" />
+        <RegistryValue Root="HKLM"
+                        Key="Software\NixRTR\NebulaCommander"
+                        Name="SharedDataFolderInstalled"
+                        Type="integer"
+                        Value="1"
+                        KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Service ACL: SYSTEM and Administrators keep full control; Authenticated
+         Users may only QUERY the service (CC LC SW LO RC - status/config/
+         interrogate), so the app can show its state and look up its PID (to
+         verify the control pipe's server). Start/Stop/Restart need an elevated
+         administrator. Earlier versions also granted AU start (RP) and stop (WP),
+         letting any user take the tunnel down. Deferred, elevated (Impersonate="no")
+         custom action, run after the service is registered and started - on fresh
+         installs and major upgrades alike (the new product is "NOT Installed"
+         during a MajorUpgrade). Verify with `sc sdshow NebulaCommanderService`. -->
+    <CustomAction Id="GrantServiceControlAcl"
+                  Directory="INSTALLDIR"
+                  ExeCommand="&quot;[SystemFolder]sc.exe&quot; sdset NebulaCommanderService &quot;D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLORC;;;AU)&quot;"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="GrantServiceControlAcl" After="StartServices" Condition="NOT Installed" />
+    </InstallExecuteSequence>
+
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="PathEnvironment" Guid="D3E4F5A6-B7C8-4D9E-0F1A-2B3C4D5E6F7A">
+        <Environment Id="PathEnv"
+                     Name="PATH"
+                     Action="set"
+                     Part="last"
+                     Permanent="no"
+                     System="yes"
+                     Value="[INSTALLDIR]" />
+      </Component>
+    </DirectoryRef>
+  </Package>
+</Wix>
